@@ -16,17 +16,21 @@ BASE_URL = "https://api.jsonbin.io/v3/b"
 
 
 def create_bin(data: dict, api_key: str, name: str = "sol-bot-state") -> str:
-    """Creates a new bin, returns its ID. Call this ONCE, then save the
-    returned ID into config.py so future runs update the SAME bin
-    instead of creating a new one every time."""
-    resp = requests.post(
-        BASE_URL,
-        json=data,
-        headers={"Content-Type": "application/json", "X-Master-Key": api_key, "X-Bin-Name": name},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()["metadata"]["id"]
+    """Creates a new bin, returns its ID, or None on failure (bad key,
+    network issue, etc.) - callers should handle None gracefully rather
+    than assuming this always succeeds."""
+    try:
+        resp = requests.post(
+            BASE_URL,
+            json=data,
+            headers={"Content-Type": "application/json", "X-Master-Key": api_key, "X-Bin-Name": name},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["metadata"]["id"]
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️  JSONBin create_bin failed: {e}")
+        return None
 
 
 def read_bin(bin_id: str, api_key: str) -> dict:

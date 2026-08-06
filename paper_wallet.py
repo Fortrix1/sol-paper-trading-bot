@@ -53,11 +53,17 @@ class PaperWallet:
                 # First run with a key but no bin yet - create one and
                 # tell the user to save the ID so it's reused going forward.
                 new_id = _jsonbin.create_bin(self.users, _config.JSONBIN_API_KEY)
-                print(f"⚠️  Created new JSONBin bin: {new_id}")
-                print(f"⚠️  IMPORTANT: paste this into config.py as JSONBIN_BIN_ID, "
-                      f"then git push - otherwise a new bin gets created every restart "
-                      f"and your data won't actually persist.")
-                _config.JSONBIN_BIN_ID = new_id  # use it for the rest of this run at least
+                if new_id:
+                    print(f"⚠️  Created new JSONBin bin: {new_id}")
+                    print(f"⚠️  IMPORTANT: paste this into config.py as JSONBIN_BIN_ID, "
+                          f"then git push - otherwise a new bin gets created every restart "
+                          f"and your data won't actually persist.")
+                    _config.JSONBIN_BIN_ID = new_id  # use it for the rest of this run at least
+                else:
+                    print("⚠️  Could not create JSONBin bin (check your API key) - "
+                          "falling back to local file for this save.")
+                    with open(self.state_file, "w") as f:
+                        json.dump(self.users, f, indent=2)
             else:
                 _jsonbin.update_bin(_config.JSONBIN_BIN_ID, self.users, _config.JSONBIN_API_KEY)
             return
