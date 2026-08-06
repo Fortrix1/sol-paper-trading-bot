@@ -1,6 +1,10 @@
 """
 paper_wallet.py - Fake SOL wallet with capped daily top-ups and open-position
-tracking. Persisted to a JSON file so state survives bot restarts.
+tracking.
+
+Persisted either to a local JSON file (default - fine for running on your
+own PC), or to JSONBin.io if configured in config.py (needed on Render's
+free tier, since local files there get wiped on every redeploy/restart).
 
 One wallet per Telegram user_id, so this is safe to use even if more than
 one person ends up talking to the bot.
@@ -11,6 +15,13 @@ import os
 import time
 import datetime
 from typing import Dict, Optional
+
+try:
+    import config as _config
+    import jsonbin_storage as _jsonbin
+    _JSONBIN_ENABLED = bool(_config.JSONBIN_API_KEY)
+except (ImportError, AttributeError):
+    _JSONBIN_ENABLED = False
 
 
 class PaperWallet:
@@ -25,6 +36,10 @@ class PaperWallet:
     # ---------- persistence ----------
 
     def _load(self):
+        if _JSONBIN_ENABLED and _config.JSONBIN_BIN_ID:
+            self.users = _jsonbin.read_bin(_config.JSONBIN_BIN_ID, _config.JSONBIN_API_KEY) or {}
+            return
+
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f:
@@ -33,6 +48,20 @@ class PaperWallet:
                 self.users = {}
 
     def _save(self):
+        if _JSONBIN_ENABLED:
+            if not _config.JSONBIN_BIN_ID:
+                # First run with a key but no bin yet - create one and
+                # tell the user to save the ID so it's reused going forward.
+                new_id = _jsonbin.create_bin(self.users, _config.JSONBIN_API_KEY)
+                print(f"⚠️  Created new JSONBin bin: {new_id}")
+                print(f"⚠️  IMPORTANT: paste this into config.py as JSONBIN_BIN_ID, "
+                      f"then git push - otherwise a new bin gets created every restart "
+                      f"and your data won't actually persist.")
+                _config.JSONBIN_BIN_ID = new_id  # use it for the rest of this run at least
+            else:
+                _jsonbin.update_bin(_config.JSONBIN_BIN_ID, self.users, _config.JSONBIN_API_KEY)
+            return
+
         with open(self.state_file, "w") as f:
             json.dump(self.users, f, indent=2)
 
