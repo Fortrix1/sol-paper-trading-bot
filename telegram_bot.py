@@ -20,6 +20,7 @@ Run:
 import re
 import io
 import time
+import asyncio
 import datetime
 import logging
 
@@ -40,6 +41,7 @@ from paper_wallet import PaperWallet
 from new_scanner import get_boosted_solana_tokens, get_graduating_coins, get_latest_new_tokens
 from helius_check import get_deployer_reputation
 from launch_watcher import get_upcoming_pool_launches, debug_check_transaction, get_recent_migrations
+import live_listener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -774,10 +776,22 @@ def start_keepalive_server():
     logger.info(f"Keep-alive HTTP server listening on port {port}")
 
 
+async def start_live_listener_task(application):
+    """
+    Runs live_listener.listen() as a background task IN THIS SAME PROCESS,
+    so it shares memory/disk with the bot - fixes the two-separate-Render-
+    services problem, where live_discoveries.jsonl written by one service
+    was invisible to the other. Now there's only one process, one disk,
+    same as running both scripts locally in the same folder.
+    """
+    asyncio.create_task(live_listener.listen())
+    logger.info("Started PumpPortal live listener as a background task.")
+
+
 def main():
     start_keepalive_server()
 
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(start_live_listener_task).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance_cmd))
