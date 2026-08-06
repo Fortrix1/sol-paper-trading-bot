@@ -1,0 +1,81 @@
+{
+  "6427084234": {
+    "balance_sol": 2.134088276278657,
+    "last_topup_date": "2026-08-05",
+    "open_positions": {},
+    "closed_trades": [
+      {
+        "mint": "Agmu8Xgn7rU4zFv4DMPrEBhYDdPsmiEG5hCiYyvSpump",
+        "symbol": "Fraggle",
+        "entry_price_usd": 0.0003071,
+        "exit_price_usd": 0.0002056,
+        "sol_spent": 0.1,
+        "sol_returned": 0.06677854602300108,
+        "pnl_sol": -0.033221453976998924,
+        "pnl_percent": -33.22145397699892,
+        "opened_at": 1785437948.1331224,
+        "closed_at": 1785438606.3128152
+      },
+      {
+        "mint": "8AJWMFNMsmkoUuwshGUXSDnF78F49KxHLXNfsrDBpump",
+        "symbol": "MAMA",
+        "entry_price_usd": 2.245e-05,
+        "exit_price_usd": 1.545e-05,
+        "sol_spent": 0.1,
+        "sol_returned": 0.06881959910913141,
+        "pnl_sol": -0.031180400890868598,
+        "pnl_percent": -31.180400890868597,
+        "opened_at": 1785441254.3232841,
+        "closed_at": 1785441316.1741066
+      },
+      {
+        "mint": "H78WENHosTWPFuQvtm8swi83ipTqANJi921iG51Apump",
+        "symbol": "LUNA",
+        "entry_price_usd": 0.0001589,
+        "exit_price_usd": 0.0001565,
+        "sol_spent": 0.1,
+        "sol_returned": 0.09846328550894067,
+        "pnl_sol": -0.0015367144910593405,
+        "pnl_percent": -1.5367144910593407,
+        "opened_at": 1785451479.1969333,
+        "closed_at": 1785451731.8537302
+      },
+      {
+        "mint": "BjTq1huMgZNde21QgiMSKCwUgY2MiDGKXftSjhQZpump",
+        "symbol": "Memeboxing",
+        "entry_price_usd": 7.511e-06,
+        "exit_price_usd": 7.511e-06,
+        "sol_spent": 0.1,
+        "sol_returned": 0.1,
+        "pnl_sol": 0.0,
+        "pnl_percent": 0.0,
+        "opened_at": 1785451908.2524223,
+        "closed_at": 1785451937.2618532
+      },
+      {
+        "mint": "H78WENHosTWPFuQvtm8swi83ipTqANJi921iG51Apump",
+        "symbol": "LUNA",
+        "entry_price_usd": 0.0001887,
+        "exit_price_usd": 0.0001887,
+        "sol_spent": 0.1,
+        "sol_returned": 0.1,
+        "pnl_sol": 0.0,
+        "pnl_percent": 0.0,
+        "opened_at": 1785451969.0813613,
+        "closed_at": 1785451978.4319534
+      },
+      {
+        "mint": "6smEdRen719LDLzRBZTeaYEVxV7a5LHVJjvnkECbpump",
+        "symbol": "CATMOTHY",
+        "entry_price_usd": 1.733e-05,
+        "exit_price_usd": 1.733e-05,
+        "sol_spent": 0.1,
+        "sol_returned": 0.10002684563758389,
+        "pnl_sol": 2.684563758388603e-05,
+        "pnl_percent": 0.02684563758388603,
+        "opened_at": 1785455589.1509678,
+        "closed_at": 1785455669.5027525
+      }
+    ]
+  }
+}
