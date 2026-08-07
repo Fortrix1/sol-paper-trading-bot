@@ -21,7 +21,7 @@ SOLANA_RPC_URL = f"https://eu.fluxrpc.com?key={RUGCHECK_API_KEY}"
 # bot ONCE, check the logs for "Created new bin: <id>", then paste that
 # ID into JSONBIN_BIN_ID and redeploy - after that it reuses the same
 # bin forever instead of creating a new one each restart.
-JSONBIN_API_KEY = "$2a$10$P47Cqc9MszALrN0QmSs6q.wlIHPi2QDfs9eW3j2Wo03avmytyeywO"
+JSONBIN_API_KEY = "$2a$10$xTIlkcWytMa.MtSe9MP1T.FCzHw1EHM90OGe3sl/RuiUSnFa9yVqK"
 JSONBIN_BIN_ID = ""
 
 # --- Paper wallet settings ---
