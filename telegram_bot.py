@@ -129,20 +129,34 @@ def get_launch_price(mint: str, sol_price_usd: float) -> dict:
 def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None, launch: dict = None) -> str:
     age = format_age(info["age_minutes"]) if info.get("age_minutes") is not None else "unknown"
 
-    # Contract safety and market activity are DIFFERENT questions - a coin
-    # can have a perfectly safe contract and still be completely dead.
     contract_line = "✅ Contract looks safe" if safety["is_safe"] else f"❌ Contract UNSAFE ({safety['reason']})"
+    activity_line = "💀 DEAD - very low liquidity/volume" if info.get("is_dead") else "✅ Active trading"
 
-    if info.get("is_dead"):
-        activity_line = "💀 DEAD - very low liquidity/volume, likely not worth trading"
+    # --- Overall rug-risk summary: consolidates several signals into one
+    # line so you don't have to mentally combine 5 different data points
+    # yourself every time. ---
+    mint_active = bool(safety.get("mint_authority"))
+    freeze_active = bool(safety.get("freeze_authority"))
+    lp_locked = safety.get("lp_locked")
+    creator_pct = safety.get("creator_holding_pct")
+
+    if mint_active or freeze_active:
+        risk_label = "🔴 HIGH - dev can still mint more supply or freeze your funds"
+    elif lp_locked is False:
+        risk_label = "🟠 MEDIUM-HIGH - liquidity isn't locked, can be pulled anytime"
+    elif (creator_pct and creator_pct > 10) or (safety.get("top_holder_pct") and safety["top_holder_pct"] > 60):
+        risk_label = "🟡 MEDIUM - supply concentrated in few wallets"
     else:
-        activity_line = "✅ Active trading"
+        risk_label = "🟢 LOWER - no major red flags found"
 
     lines = [
         f"*{info['name']} ({info['symbol']})*",
         f"`{mint}`",
         "",
-        f"Price: `${info['price_usd']:.8f}`",
+        f"⚠️ *Rug risk:* {risk_label}",
+        "",
+        "*— Price —*",
+        f"Now: `${info['price_usd']:.8f}`",
     ]
 
     if launch and launch.get("ok"):
@@ -150,38 +164,59 @@ def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
         lines.append(f"Launched at: `${launch['launch_price_usd']:.8f}`  ·  Change: `{change_pct:+.1f}%`")
 
     lines += [
-        f"Liquidity: `${info['liquidity_usd']:,.0f}`",
-        f"24h Volume: `${info['volume_24h_usd']:,.0f}`",
-        f"Market Cap: `${info['mcap_usd']:,.0f}`",
-        f"Age: `{age}`",
-        f"Dex boosted (paid): `{'Yes' if info.get('is_boosted') else 'No'}`",
+        f"Liquidity: `${info['liquidity_usd']:,.0f}`  ·  24h Vol: `${info['volume_24h_usd']:,.0f}`",
+        f"Market Cap: `${info['mcap_usd']:,.0f}`" + (f"  ·  FDV: `${info['fdv_usd']:,.0f}`" if info.get("fdv_usd") else ""),
+    ]
+    if info.get("fdv_usd") and info["fdv_usd"] > 0:
+        circ_pct = info["mcap_usd"] / info["fdv_usd"] * 100
+        lines.append(f"Circulating supply: `{circ_pct:.0f}%` of total is in public hands")
+
+    lines += [
+        f"Age: `{age}`  ·  Dex boosted: `{'Yes' if info.get('is_boosted') else 'No'}`",
         "",
+        "*— Contract —*",
         contract_line,
         activity_line,
+        f"Renounced: {'✅' if not mint_active else '❌ Mint authority still active'}",
     ]
+    if freeze_active:
+        lines.append("❌ Freeze authority still active")
+    if lp_locked is not None:
+        lines.append(f"Liquidity locked: `{'Yes' if lp_locked else 'No - can be pulled anytime'}`")
 
-    # Renounced badge - matches how Trojan/Photon-style bots show this:
-    # a clean checkmark when mint authority is gone, not just a warning
-    # when it's active.
-    if safety.get("mint_authority") is not None or safety.get("is_safe") is not None:
-        renounced = not safety.get("mint_authority")
-        lines.append(f"Renounced: {'✅' if renounced else '❌ Mint authority still active'}")
-
-    if safety.get("top_holder_pct") is not None:
-        lines.append(f"Top 10 holders own: `{safety['top_holder_pct']:.0f}%`")
-    if safety.get("lp_locked") is not None:
-        lines.append(f"Liquidity locked: `{'Yes' if safety['lp_locked'] else 'No'}`")
-    if safety.get("freeze_authority"):
-        lines.append("⚠️ Freeze authority still active")
-
+    # --- Deployer / dev wallet ---
+    lines += ["", "*— Deployer —*"]
+    if safety.get("creator"):
+        lines.append(f"Wallet: `{safety['creator']}`")
+        if creator_pct is not None:
+            lines.append(f"Dev directly holds: `{creator_pct:.1f}%` of supply")
+        else:
+            lines.append("Dev holding: not in top 10 holders (or unknown)")
     if dev_rep and dev_rep.get("ok"):
         if dev_rep["is_brand_new_wallet"]:
-            lines.append("👤 Dev wallet: brand new (little/no history)")
+            lines.append("Wallet history: brand new (little/no prior activity)")
         else:
             lines.append(
-                f"👤 Dev wallet: {dev_rep['txn_count_sampled']} txns seen, "
+                f"Wallet history: {dev_rep['txn_count_sampled']} txns seen, "
                 f"~{dev_rep['likely_tokens_created']} look like token creations"
             )
+    lines.append("_Note: full track record (past rugs vs successful launches) isn't reliably "
+                  "trackable yet - this is a rough proxy from recent wallet activity only, not a real history._")
+
+    # --- Top holders, shown raw so you can eyeball sybil patterns yourself ---
+    if safety.get("top_holders_list"):
+        lines += ["", "*— Top Holders —*"]
+        for h in safety["top_holders_list"][:5]:
+            addr = h.get("address") or "unknown"
+            short_addr = f"{addr[:4]}...{addr[-4:]}" if addr and len(addr) > 10 else addr
+            tag = " 👤(dev)" if addr == safety.get("creator") else ""
+            lines.append(f"`{short_addr}` - `{h.get('pct', 0):.1f}%`{tag}")
+
+    # --- Socials, stated explicitly not just as buttons ---
+    lines += ["", "*— Socials —*"]
+    lines.append(f"X: {'✅' if info.get('twitter_url') else '❌ none found'}  ·  "
+                 f"Telegram: {'✅' if info.get('telegram_url') else '❌ none found'}  ·  "
+                 f"Website: {'✅' if info.get('website_url') else '❌ none found'}")
 
     lines.append("")
     lines.append("_This is a PAPER trade - no real funds involved._")

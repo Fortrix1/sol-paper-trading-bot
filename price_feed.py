@@ -65,6 +65,7 @@ def get_token_info(mint: str) -> dict:
             "liquidity_usd": liquidity_usd,
             "volume_24h_usd": volume_24h_usd,
             "mcap_usd": float(best.get("marketCap", 0) or best.get("fdv", 0) or 0),
+            "fdv_usd": float(best.get("fdv", 0) or 0),
             "pair_url": best.get("url"),
             "age_minutes": age_minutes,
             "is_dead": is_dead,

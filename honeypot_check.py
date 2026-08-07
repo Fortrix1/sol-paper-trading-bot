@@ -44,9 +44,19 @@ class HoneypotChecker:
 
             top_holders = result.get("topHolders") or result.get("top_holders") or []
             top_holder_pct = None
+            top_holders_list = []
+            creator = result.get("creator") or result.get("deployer")
+            creator_holding_pct = None
+
             if top_holders:
                 try:
                     top_holder_pct = sum(float(h.get("pct", 0)) for h in top_holders[:10])
+                    for h in top_holders[:10]:
+                        addr = h.get("address") or h.get("owner")
+                        pct = float(h.get("pct", 0))
+                        top_holders_list.append({"address": addr, "pct": pct})
+                        if creator and addr == creator:
+                            creator_holding_pct = pct
                 except (TypeError, ValueError):
                     top_holder_pct = None
 
@@ -54,8 +64,6 @@ class HoneypotChecker:
             lp_locked = None
             if markets:
                 lp_locked = any(m.get("lpLocked") or m.get("liquidityLocked") for m in markets if isinstance(m, dict))
-
-            creator = result.get("creator") or result.get("deployer")
 
             risk_flags = []
             if mint_authority not in (None, "", "null"):
@@ -66,13 +74,17 @@ class HoneypotChecker:
                 risk_flags.append(f"top 10 holders control {top_holder_pct:.0f}% of supply")
             if lp_locked is False:
                 risk_flags.append("liquidity not locked")
+            if creator_holding_pct is not None and creator_holding_pct > 10:
+                risk_flags.append(f"deployer wallet directly holds {creator_holding_pct:.1f}% of supply")
 
             extra = {
                 "mint_authority": mint_authority,
                 "freeze_authority": freeze_authority,
                 "top_holder_pct": top_holder_pct,
+                "top_holders_list": top_holders_list,
                 "lp_locked": lp_locked,
                 "creator": creator,
+                "creator_holding_pct": creator_holding_pct,
                 "risk_flags": risk_flags,
             }
 
@@ -95,6 +107,6 @@ class HoneypotChecker:
                 "reason": f"API check failed (Error: {type(e).__name__})", 
                 "details": {},
                 "mint_authority": None, "freeze_authority": None,
-                "top_holder_pct": None, "lp_locked": None,
-                "creator": None, "risk_flags": [],
+                "top_holder_pct": None, "top_holders_list": [], "lp_locked": None,
+                "creator": None, "creator_holding_pct": None, "risk_flags": [],
             }
