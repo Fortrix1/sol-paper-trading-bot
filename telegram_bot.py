@@ -57,6 +57,9 @@ RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{}/report"
 
 # Loose check for something that looks like a Solana base58 mint address
 MINT_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+# Same character class, but for finding an address INSIDE a larger message
+# (e.g. one of /new's feed messages) rather than matching the whole string.
+MINT_SEARCH_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 
 
 def check_safety(mint: str) -> dict:
@@ -265,7 +268,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/new — brand-new tokens (live if listener running, else on-demand)\n"
         "/graduated — tokens that just migrated to PumpSwap (live if listener running)\n"
         "/launching — Raydium CPMM pools with a future open time (rare, separate on-demand check)\n"
-        "/checktx <signature> — debug tool for verifying on-chain detection against a known transaction\n",
+        "/checktx <signature> — debug tool for verifying on-chain detection against a known transaction\n"
+        "/analyse — reply to any message showing a token (from /new, /graduated, etc.) to get the full breakdown\n",
         parse_mode="Markdown",
     )
 
@@ -379,14 +383,12 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # genuinely real-time, not a REST snapshot that can lag.
     live_new = read_live_discoveries("new_token", max_age_seconds=600)
     if live_new:
-        lines = [f"🆕 *{len(live_new)} brand-new token(s) caught live (PumpPortal)*", ""]
+        await update.message.reply_text(f"🆕 *{len(live_new)} brand-new token(s) caught live (PumpPortal)*", parse_mode="Markdown")
         for t in live_new[:8]:
             ago = int(time.time() - t["discovered_at"])
             ago_str = f"{ago}s" if ago < 60 else format_age(ago // 60)
-            lines.append(f"*{t.get('symbol', '?')}* - `{ago_str} ago`")
-            lines.append(f"`{t['mint']}`")
-            lines.append("")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            text = f"*{t.get('symbol', '?')}* - `{ago_str} ago`\n`{t['mint']}`\n\n_Reply /analyse to this message for full details_"
+            await update.message.reply_text(text, parse_mode="Markdown")
     else:
         await update.message.reply_text(
             "No live listener data yet (run live_listener.py for instant results) - "
@@ -672,6 +674,31 @@ async def build_token_card(mint: str):
     return card, InlineKeyboardMarkup(keyboard_rows), None
 
 
+async def analyse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    replied = update.message.reply_to_message
+    if not replied or not replied.text:
+        await update.message.reply_text(
+            "Reply to a message that shows a token (e.g. one from /new or /graduated) "
+            "with /analyse to get the full breakdown for that coin."
+        )
+        return
+
+    match = MINT_SEARCH_PATTERN.search(replied.text)
+    if not match:
+        await update.message.reply_text("Couldn't find a token address in that message.")
+        return
+
+    mint = match.group(0)
+    await update.message.reply_text(f"🔎 Analysing `{mint}`...", parse_mode="Markdown")
+
+    card, keyboard, error = await build_token_card(mint)
+    if error:
+        await update.message.reply_text(f"Couldn't analyse that token: {error}")
+        return
+
+    await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
+
+
 async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not MINT_PATTERN.match(text):
@@ -837,6 +864,7 @@ def main():
     app.add_handler(CommandHandler("launching", launching_cmd))
     app.add_handler(CommandHandler("graduated", graduated_cmd))
     app.add_handler(CommandHandler("checktx", checktx_cmd))
+    app.add_handler(CommandHandler(["analyse", "analysis"], analyse_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
 
