@@ -22,7 +22,7 @@ SOLANA_RPC_URL = f"https://eu.fluxrpc.com?key={RUGCHECK_API_KEY}"
 # ID into JSONBIN_BIN_ID and redeploy - after that it reuses the same
 # bin forever instead of creating a new one each restart.
 JSONBIN_API_KEY = "$2a$10$xTIlkcWytMa.MtSe9MP1T.FCzHw1EHM90OGe3sl/RuiUSnFa9yVqK"
-JSONBIN_BIN_ID = ""
+JSONBIN_BIN_ID = "6a766e16da38895dfec84c4e"
 
 # --- Paper wallet settings ---
 STARTING_BALANCE_SOL = 1.0      # what a brand-new user starts with
