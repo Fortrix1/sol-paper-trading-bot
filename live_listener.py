@@ -28,6 +28,7 @@ Run:
 import asyncio
 import json
 import time
+import os
 import logging
 
 import websockets
@@ -37,16 +38,70 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://pumpportal.fun/api/data"
 DISCOVERIES_FILE = "live_discoveries.jsonl"
+LAUNCH_INDEX_FILE = "launch_index.jsonl"   # separate, more generously-capped store just for launch-price lookups
+MAX_LAUNCH_INDEX = 10000                    # much higher cap - these records are small, and this is what /analyse relies on
 
 _debug_logged = {}
 _debug_limit = 3
 
+MAX_DISCOVERIES = 2000        # keep at most this many recent entries
+TRIM_CHECK_EVERY = 100        # only check/trim every N writes, not every single one
+_write_count = 0
+
+
+def _trim_discoveries_file():
+    """Keeps only the most recent MAX_DISCOVERIES lines. Prevents the file
+    from growing forever, which was very likely eating memory/CPU on
+    Render's free tier over hours of continuous running and causing the
+    process to eventually die."""
+    if not os.path.exists(DISCOVERIES_FILE):
+        return
+    try:
+        with open(DISCOVERIES_FILE) as f:
+            lines = f.readlines()
+        if len(lines) > MAX_DISCOVERIES:
+            with open(DISCOVERIES_FILE, "w") as f:
+                f.writelines(lines[-MAX_DISCOVERIES:])
+            logger.info(f"Trimmed discoveries file: {len(lines)} -> {MAX_DISCOVERIES} lines")
+    except IOError:
+        pass
+
+
+def _trim_launch_index():
+    if not os.path.exists(LAUNCH_INDEX_FILE):
+        return
+    try:
+        with open(LAUNCH_INDEX_FILE) as f:
+            lines = f.readlines()
+        if len(lines) > MAX_LAUNCH_INDEX:
+            with open(LAUNCH_INDEX_FILE, "w") as f:
+                f.writelines(lines[-MAX_LAUNCH_INDEX:])
+    except IOError:
+        pass
+
+
+def _log_launch_index(record: dict):
+    """Separate, more generously-sized store just for launch-price lookups
+    (/analyse relies on this). Kept apart from the general discoveries
+    feed so busy periods don't evict a token's launch data before you get
+    a chance to check it."""
+    with open(LAUNCH_INDEX_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    global _write_count
+    if _write_count % TRIM_CHECK_EVERY == 0:
+        _trim_launch_index()
+
 
 def _log_discovery(record: dict):
+    global _write_count
     record["discovered_at"] = time.time()
     with open(DISCOVERIES_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
     logger.info(f"DISCOVERY: {record.get('type')} - mint={record.get('mint')}")
+
+    _write_count += 1
+    if _write_count % TRIM_CHECK_EVERY == 0:
+        _trim_discoveries_file()
 
 
 def _handle_message(raw_message: str):
@@ -83,13 +138,18 @@ def _handle_message(raw_message: str):
         logger.info(f"RAW MESSAGE ({event_type}, {seen + 1}/{_debug_limit}): {raw_message[:500]}")
         _debug_logged[event_type] = seen + 1
 
-    _log_discovery({
+    record = {
         "type": event_type,
         "mint": mint,
         "symbol": msg.get("symbol"),
         "name": msg.get("name"),
         "raw": msg,
-    })
+    }
+    _log_discovery(record)  # stamps record["discovered_at"] internally
+    if event_type == "new_token":
+        # Separately preserved so /analyse can still find launch price
+        # even if this record gets trimmed from the busy general feed.
+        _log_launch_index(dict(record))
 
 
 async def listen():

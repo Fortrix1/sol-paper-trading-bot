@@ -85,10 +85,12 @@ def format_age(age_minutes: int) -> str:
 
 def get_launch_price(mint: str, sol_price_usd: float) -> dict:
     """
-    Looks up a token's price AT CREATION by finding its earliest
-    "new_token" record in live_discoveries.jsonl (written by
-    live_listener.py) and computing price from the raw bonding-curve
-    reserves PumpPortal reports at that moment.
+    Looks up a token's price AT CREATION from launch_index.jsonl (a
+    durable, more generously-sized store live_listener.py maintains
+    specifically for this - separate from the busy general feed, which
+    gets trimmed and can lose a token's record before you check it).
+    Falls back to the general feed for anything logged before this
+    separate index existed.
     Returns {ok, launch_price_usd, launch_timestamp} or {ok: False}.
     Approximation note: uses CURRENT sol_price_usd for the conversion
     (not the SOL price at the exact moment of launch), so this is close
@@ -97,24 +99,26 @@ def get_launch_price(mint: str, sol_price_usd: float) -> dict:
     """
     import json as _json
     import os as _os
-    path = "live_discoveries.jsonl"
-    if not _os.path.exists(path):
-        return {"ok": False}
 
-    earliest = None
-    try:
-        with open(path) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                rec = _json.loads(line)
-                if rec.get("type") != "new_token" or rec.get("mint") != mint:
-                    continue
-                if earliest is None or rec.get("discovered_at", 0) < earliest.get("discovered_at", 0):
-                    earliest = rec
-    except (IOError, _json.JSONDecodeError):
-        return {"ok": False}
+    def _search(path):
+        if not _os.path.exists(path):
+            return None
+        earliest = None
+        try:
+            with open(path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = _json.loads(line)
+                    if rec.get("type") != "new_token" or rec.get("mint") != mint:
+                        continue
+                    if earliest is None or rec.get("discovered_at", 0) < earliest.get("discovered_at", 0):
+                        earliest = rec
+        except (IOError, _json.JSONDecodeError):
+            return None
+        return earliest
 
+    earliest = _search("launch_index.jsonl") or _search("live_discoveries.jsonl")
     if not earliest:
         return {"ok": False}
 
@@ -138,12 +142,22 @@ def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
     # --- Overall rug-risk summary: consolidates several signals into one
     # line so you don't have to mentally combine 5 different data points
     # yourself every time. ---
+    #
+    # CRITICAL: if the safety check itself FAILED (API error, not an
+    # actual clean result), every field below is None - treating that as
+    # "no red flags found" would be a real bug (looks safe when we simply
+    # have no data). Must fail unsafe/unknown here, matching the honeypot
+    # check's own fail-safe design.
+    check_failed = not safety.get("is_safe") and "API check failed" in str(safety.get("reason", ""))
+
     mint_active = bool(safety.get("mint_authority"))
     freeze_active = bool(safety.get("freeze_authority"))
     lp_locked = safety.get("lp_locked")
     creator_pct = safety.get("creator_holding_pct")
 
-    if mint_active or freeze_active:
+    if check_failed:
+        risk_label = "⚫ UNKNOWN - safety check failed, could NOT verify this token. Treat as risky until confirmed."
+    elif mint_active or freeze_active:
         risk_label = "🔴 HIGH - dev can still mint more supply or freeze your funds"
     elif lp_locked is False:
         risk_label = "🟠 MEDIUM-HIGH - liquidity isn't locked, can be pulled anytime"
@@ -180,7 +194,7 @@ def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
         "*— Contract —*",
         contract_line,
         activity_line,
-        f"Renounced: {'✅' if not mint_active else '❌ Mint authority still active'}",
+        f"Renounced: {'⚫ Unknown (check failed)' if check_failed else ('✅' if not mint_active else '❌ Mint authority still active')}",
     ]
     if freeze_active:
         lines.append("❌ Freeze authority still active")
@@ -639,11 +653,95 @@ async def launching_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+def get_raw_creation_record(mint: str) -> dict:
+    """Returns the raw PumpPortal 'new_token' record our own listener
+    captured at creation, if any - used as a fallback when DexScreener
+    hasn't indexed a trading pair yet (very common for tokens seconds old,
+    exactly the case /analyse is often used for)."""
+    import json as _json
+    import os as _os
+    def _search(path):
+        if not _os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = _json.loads(line)
+                    if rec.get("type") == "new_token" and rec.get("mint") == mint:
+                        return rec
+        except (IOError, _json.JSONDecodeError):
+            return None
+        return None
+
+    return _search("launch_index.jsonl") or _search("live_discoveries.jsonl")
+
+
+def format_minimal_card(mint: str, raw_record: dict, sol_price_usd: float, safety: dict = None) -> str:
+    """Fallback card built from our own captured creation data, for when
+    DexScreener hasn't indexed this token yet (common for very fresh
+    tokens - which is exactly when /analyse tends to get used)."""
+    raw = raw_record.get("raw", {})
+    name = raw.get("name") or raw_record.get("name") or "?"
+    symbol = raw.get("symbol") or raw_record.get("symbol") or "?"
+
+    lines = [
+        f"*{name} ({symbol})*",
+        f"`{mint}`",
+        "",
+        "_⚠️ Too new for DexScreener yet - showing what was captured at creation. "
+        "Try /analyse again in a minute for full price/liquidity data._",
+        "",
+    ]
+
+    v_sol = raw.get("vSolInBondingCurve")
+    v_tokens = raw.get("vTokensInBondingCurve")
+    if v_sol and v_tokens and sol_price_usd > 0:
+        launch_price = (v_sol / v_tokens) * sol_price_usd
+        lines.append(f"Launch price: `${launch_price:.8f}`")
+    if raw.get("marketCapSol") and sol_price_usd > 0:
+        lines.append(f"Market Cap at creation: `${raw['marketCapSol'] * sol_price_usd:,.0f}`")
+    if raw.get("solAmount"):
+        lines.append(f"Initial buy: `{raw['solAmount']:.3f} SOL`")
+
+    ago = int(time.time() - raw_record.get("discovered_at", time.time()))
+    ago_str = f"{ago}s ago" if ago < 60 else format_age(ago // 60) + " ago"
+    lines.append(f"Caught: `{ago_str}`")
+
+    if safety:
+        lines.append("")
+        lines.append("*— Contract —*")
+        min_check_failed = not safety.get("is_safe") and "API check failed" in str(safety.get("reason", ""))
+        contract_line = "✅ Contract looks safe" if safety.get("is_safe") else f"❌ Contract UNSAFE ({safety.get('reason')})"
+        lines.append(contract_line)
+        if min_check_failed:
+            lines.append("Renounced: ⚫ Unknown (check failed)")
+        else:
+            renounced = not safety.get("mint_authority")
+            lines.append(f"Renounced: {'✅' if renounced else '❌ Mint authority still active'}")
+        if safety.get("freeze_authority"):
+            lines.append("❌ Freeze authority still active")
+
+    lines.append("")
+    lines.append("_This is a PAPER trade - no real funds involved._")
+    return "\n".join(lines)
+
+
 async def build_token_card(mint: str):
     """Builds the (card_text, keyboard) pair for a token - shared by
     handle_ca and the Refresh button so both stay in sync."""
     info = get_token_info(mint)
     if not info["ok"]:
+        raw_record = get_raw_creation_record(mint)
+        if raw_record:
+            sol_price = get_sol_usd_price()
+            safety = check_safety(mint)  # doesn't depend on DexScreener, try it anyway
+            card = format_minimal_card(mint, raw_record, sol_price, safety)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
+            ]])
+            return card, keyboard, None
         return None, None, info.get("error", "unknown error")
 
     safety = check_safety(mint)

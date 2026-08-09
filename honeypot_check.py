@@ -23,7 +23,7 @@ class HoneypotChecker:
         """
         headers = {}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["X-API-KEY"] = self.api_key
             
         params = {"token_address": token_mint}
         
