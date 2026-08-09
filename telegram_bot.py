@@ -397,12 +397,23 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # genuinely real-time, not a REST snapshot that can lag.
     live_new = read_live_discoveries("new_token", max_age_seconds=600)
     if live_new:
-        await update.message.reply_text(f"🆕 *{len(live_new)} brand-new token(s) caught live (PumpPortal)*", parse_mode="Markdown")
-        for t in live_new[:8]:
-            ago = int(time.time() - t["discovered_at"])
-            ago_str = f"{ago}s" if ago < 60 else format_age(ago // 60)
-            text = f"*{t.get('symbol', '?')}* - `{ago_str} ago`\n`{t['mint']}`\n\n_Reply /analyse to this message for full details_"
-            await update.message.reply_text(text, parse_mode="Markdown")
+        shown = live_new[:8]
+        if len(live_new) > len(shown):
+            await update.message.reply_text(
+                f"🆕 *{len(live_new)} brand-new token(s) caught live - showing the {len(shown)} most recent (PumpPortal)*",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(f"🆕 *{len(shown)} brand-new token(s) caught live (PumpPortal)*", parse_mode="Markdown")
+        for t in shown:
+            try:
+                card, keyboard, error = await build_token_card(t["mint"])
+                if error:
+                    logger.warning(f"Auto-analysis failed for {t.get('mint')}: {error}")
+                    continue
+                await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
+            except Exception as e:
+                logger.warning(f"Failed to send new-token entry for {t.get('mint')}: {e}")
     else:
         await update.message.reply_text(
             "No live listener data yet (run live_listener.py for instant results) - "
@@ -540,15 +551,27 @@ async def graduated_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Live feed of tokens that just graduated from pump.fun to PumpSwap (the real, current graduation mechanism)."""
     live = read_live_discoveries("migration")
     if live:
-        await update.message.reply_text(f"🎓 {len(live)} graduation(s) caught live by the listener:")
-        for mig in live[:8]:
-            ago = format_age(int((time.time() - mig["discovered_at"]) // 60))
-            lines = [f"🎓 *Graduated ~{ago} ago (live)*", f"Mint: `{mig.get('mint', 'unknown')}`"]
-            if mig.get("mint"):
-                safety = check_safety(mig["mint"])
-                if not safety.get("mint_authority") and not safety.get("freeze_authority"):
-                    lines.append("✅ No mint/freeze authority red flags")
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        shown = live[:8]
+        if len(live) > len(shown):
+            await update.message.reply_text(
+                f"🎓 {len(live)} graduation(s) caught live - showing the {len(shown)} most recent:"
+            )
+        else:
+            await update.message.reply_text(f"🎓 {len(shown)} graduation(s) caught live by the listener:")
+        for mig in shown:
+            try:
+                mint = mig.get("mint")
+                if not mint:
+                    continue
+                card, keyboard, error = await build_token_card(mint)
+                if error:
+                    logger.warning(f"Auto-analysis failed for {mint}: {error}")
+                    continue
+                ago = format_age(int((time.time() - mig["discovered_at"]) // 60))
+                card = f"🎓 *Graduated ~{ago} ago (live)*\n\n" + card
+                await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
+            except Exception as e:
+                logger.warning(f"Failed to send graduation entry for {mig.get('mint')}: {e}")
         return
 
     await update.message.reply_text(
