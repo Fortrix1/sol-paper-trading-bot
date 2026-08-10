@@ -24,12 +24,12 @@ class HoneypotChecker:
         headers = {}
         if self.api_key:
             headers["X-API-KEY"] = self.api_key
-            
-        params = {"token_address": token_mint}
-        
+
         try:
-            # Set a strict timeout to avoid blocking the trading loop
-            response = requests.get(self.api_endpoint, headers=headers, params=params, timeout=5)
+            # Mint is already embedded in the URL path (api_endpoint) - no
+            # extra query param needed. Set a strict timeout to avoid
+            # blocking the trading loop.
+            response = requests.get(self.api_endpoint, headers=headers, timeout=5)
             response.raise_for_status()
             result = response.json()
             
@@ -101,10 +101,12 @@ class HoneypotChecker:
             
         except requests.exceptions.RequestException as e:
             # SAFETY CRITICAL: Default to False if the check cannot be completed.
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            detail = f"HTTP {status_code}" if status_code else type(e).__name__
             print(f"ERROR: Honeypot API check failed for {token_mint}: {e}")
             return {
                 "is_safe": False, 
-                "reason": f"API check failed (Error: {type(e).__name__})", 
+                "reason": f"API check failed ({detail})", 
                 "details": {},
                 "mint_authority": None, "freeze_authority": None,
                 "top_holder_pct": None, "top_holders_list": [], "lp_locked": None,
