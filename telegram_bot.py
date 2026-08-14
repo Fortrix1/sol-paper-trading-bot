@@ -1,20 +1,7 @@
 """
-telegram_bot.py - Paper-trading Telegram bot for practicing Solana token
-decisions with fake SOL, before risking real capital.
-
-Flow:
-  - Send a token mint address (CA) -> bot replies with a live token card
-    (price, liquidity, mcap, age, honeypot/safety verdict) + a Buy button.
-  - Tap Buy -> opens a fake position sized at DEFAULT_BUY_SIZE_SOL.
-  - Every PRICE_UPDATE_INTERVAL_SECONDS, the bot pushes a live P&L update
-    for each open position, with a Sell button.
-  - Tap Sell -> closes the position, credits/debits your fake balance.
-  - Fake balance starts at STARTING_BALANCE_SOL and grows by
-    DAILY_TOPUP_SOL per day, capped at BALANCE_CAP_SOL.
-
-Run:
-    pip install -r requirements.txt
-    python telegram_bot.py
+telegram_bot.py - Paper-trading Telegram bot with GOLDMINE detection,
+conviction scoring, autopilot, BONDED curve sniping, bundle detection,
+and smart money tracking.
 """
 
 import re
@@ -25,7 +12,7 @@ import datetime
 import logging
 
 import matplotlib
-matplotlib.use("Agg")  # no display needed, just render to image bytes
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,6 +28,10 @@ from paper_wallet import PaperWallet
 from new_scanner import get_boosted_solana_tokens, get_graduating_coins, get_latest_new_tokens
 from helius_check import get_deployer_reputation
 from launch_watcher import get_upcoming_pool_launches, debug_check_transaction, get_recent_migrations
+from conviction_engine import ConvictionEngine
+from auto_paper_trader import AutoPaperTrader
+from risk_manager import RiskManager
+from smart_money_tracker import SmartMoneyTracker
 import live_listener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,12 +44,15 @@ wallet = PaperWallet(
     cap=config.BALANCE_CAP_SOL,
 )
 
-RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{}/report"
+risk_mgr = RiskManager()
+conviction = ConvictionEngine()
+auto_trader = AutoPaperTrader(wallet, risk_mgr)
+smart_money = SmartMoneyTracker()
 
-# Loose check for something that looks like a Solana base58 mint address
+autopilot_states = {}
+
+RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{}/report"
 MINT_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-# Same character class, but for finding an address INSIDE a larger message
-# (e.g. one of /new's feed messages) rather than matching the whole string.
 MINT_SEARCH_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 
 
@@ -71,7 +65,9 @@ def check_safety(mint: str) -> dict:
     return checker.check_token_safety(mint)
 
 
-def format_age(age_minutes: int) -> str:
+def format_age(age_minutes):
+    if age_minutes is None:
+        return "unknown"
     if age_minutes < 60:
         return f"{age_minutes}m"
     hours = age_minutes // 60
@@ -84,19 +80,6 @@ def format_age(age_minutes: int) -> str:
 
 
 def get_launch_price(mint: str, sol_price_usd: float) -> dict:
-    """
-    Looks up a token's price AT CREATION from launch_index.jsonl (a
-    durable, more generously-sized store live_listener.py maintains
-    specifically for this - separate from the busy general feed, which
-    gets trimmed and can lose a token's record before you check it).
-    Falls back to the general feed for anything logged before this
-    separate index existed.
-    Returns {ok, launch_price_usd, launch_timestamp} or {ok: False}.
-    Approximation note: uses CURRENT sol_price_usd for the conversion
-    (not the SOL price at the exact moment of launch), so this is close
-    but not exact for the USD figure - fine for recently-launched coins
-    where SOL's price hasn't moved much since.
-    """
     import json as _json
     import os as _os
 
@@ -133,108 +116,101 @@ def get_launch_price(mint: str, sol_price_usd: float) -> dict:
     return {"ok": True, "launch_price_usd": price_usd, "launch_timestamp": earliest.get("discovered_at")}
 
 
-def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None, launch: dict = None) -> str:
-    age = format_age(info["age_minutes"]) if info.get("age_minutes") is not None else "unknown"
+def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
+                      launch: dict = None, eval_result: dict = None) -> str:
+    age = format_age(info.get("age_minutes"))
 
-    contract_line = "✅ Contract looks safe" if safety["is_safe"] else f"❌ Contract UNSAFE ({safety['reason']})"
+    contract_line = "✅ Contract looks safe" if safety.get("is_safe") else f"❌ Contract UNSAFE ({safety.get('reason')})"
     activity_line = "💀 DEAD - very low liquidity/volume" if info.get("is_dead") else "✅ Active trading"
 
-    # --- Overall rug-risk summary: consolidates several signals into one
-    # line so you don't have to mentally combine 5 different data points
-    # yourself every time. ---
-    #
-    # CRITICAL: if the safety check itself FAILED (API error, not an
-    # actual clean result), every field below is None - treating that as
-    # "no red flags found" would be a real bug (looks safe when we simply
-    # have no data). Must fail unsafe/unknown here, matching the honeypot
-    # check's own fail-safe design.
     check_failed = not safety.get("is_safe") and "API check failed" in str(safety.get("reason", ""))
-
     mint_active = bool(safety.get("mint_authority"))
     freeze_active = bool(safety.get("freeze_authority"))
     lp_locked = safety.get("lp_locked")
     creator_pct = safety.get("creator_holding_pct")
 
     if check_failed:
-        risk_label = "⚫ UNKNOWN - safety check failed, could NOT verify this token. Treat as risky until confirmed."
+        risk_label = "⚫ UNKNOWN - safety check failed"
     elif mint_active or freeze_active:
-        risk_label = "🔴 HIGH - dev can still mint more supply or freeze your funds"
+        risk_label = "🔴 HIGH - dev can mint/freeze"
     elif lp_locked is False:
-        risk_label = "🟠 MEDIUM-HIGH - liquidity isn't locked, can be pulled anytime"
+        risk_label = "🟠 MEDIUM-HIGH - liquidity unlocked"
     elif (creator_pct and creator_pct > 10) or (safety.get("top_holder_pct") and safety["top_holder_pct"] > 60):
-        risk_label = "🟡 MEDIUM - supply concentrated in few wallets"
+        risk_label = "🟡 MEDIUM - supply concentrated"
     else:
-        risk_label = "🟢 LOWER - no major red flags found"
+        risk_label = "🟢 LOWER - no major red flags"
 
     lines = [
-        f"*{info['name']} ({info['symbol']})*",
+        f"*{info.get('name', '?')} ({info.get('symbol', '?')})*",
         f"`{mint}`",
         "",
+    ]
+
+    if eval_result:
+        e = eval_result
+        lines.append(f"{e['verdict_emoji']} *Conviction: {e['score']:.0f}/100* — `{e['verdict']}`")
+        if e.get("bonding_progress") is not None:
+            bar_filled = int(e["bonding_progress"] / 10)
+            bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+            lines.append(f"📊 Bonding: {bar} `{e['bonding_progress']:.0f}%`")
+        if e.get("initial_buy_sol"):
+            lines.append(f"💰 Initial buy: `{e['initial_buy_sol']:.2f} SOL`")
+        lines.append("")
+
+    lines += [
         f"⚠️ *Rug risk:* {risk_label}",
         "",
         "*— Price —*",
-        f"Now: `${info['price_usd']:.8f}`",
+        f"Now: `${info.get('price_usd', 0):.8f}`",
     ]
 
     if launch and launch.get("ok"):
         change_pct = ((info["price_usd"] - launch["launch_price_usd"]) / launch["launch_price_usd"] * 100) if launch["launch_price_usd"] > 0 else 0
-        lines.append(f"Launched at: `${launch['launch_price_usd']:.8f}`  ·  Change: `{change_pct:+.1f}%`")
+        lines.append(f"Launched: `${launch['launch_price_usd']:.8f}` · Change: `{change_pct:+.1f}%`")
 
     lines += [
-        f"Liquidity: `${info['liquidity_usd']:,.0f}`  ·  24h Vol: `${info['volume_24h_usd']:,.0f}`",
-        f"Market Cap: `${info['mcap_usd']:,.0f}`" + (f"  ·  FDV: `${info['fdv_usd']:,.0f}`" if info.get("fdv_usd") else ""),
-    ]
-    if info.get("fdv_usd") and info["fdv_usd"] > 0:
-        circ_pct = info["mcap_usd"] / info["fdv_usd"] * 100
-        lines.append(f"Circulating supply: `{circ_pct:.0f}%` of total is in public hands")
-
-    lines += [
-        f"Age: `{age}`  ·  Dex boosted: `{'Yes' if info.get('is_boosted') else 'No'}`",
+        f"Liq: `${info.get('liquidity_usd', 0):,.0f}` · 24h Vol: `${info.get('volume_24h_usd', 0):,.0f}`",
+        f"MCap: `${info.get('mcap_usd', 0):,.0f}`" + (f" · FDV: `${info.get('fdv_usd', 0):,.0f}`" if info.get("fdv_usd") else ""),
+        f"Age: `{age}` · Boosted: `{'Yes' if info.get('is_boosted') else 'No'}`",
         "",
         "*— Contract —*",
         contract_line,
         activity_line,
-        f"Renounced: {'⚫ Unknown (check failed)' if check_failed else ('✅' if not mint_active else '❌ Mint authority still active')}",
     ]
-    if freeze_active:
-        lines.append("❌ Freeze authority still active")
-    if lp_locked is not None:
-        lines.append(f"Liquidity locked: `{'Yes' if lp_locked else 'No - can be pulled anytime'}`")
 
-    # --- Deployer / dev wallet ---
+    if check_failed:
+        lines.append("Renounced: ⚫ Unknown")
+    else:
+        lines.append(f"Renounced: {'✅' if not mint_active else '❌ Mint active'}")
+    if freeze_active:
+        lines.append("❌ Freeze authority active")
+    if lp_locked is not None:
+        lines.append(f"LP locked: `{'Yes' if lp_locked else 'No - pullable'}`")
+
     lines += ["", "*— Deployer —*"]
     if safety.get("creator"):
         lines.append(f"Wallet: `{safety['creator']}`")
         if creator_pct is not None:
-            lines.append(f"Dev directly holds: `{creator_pct:.1f}%` of supply")
-        else:
-            lines.append("Dev holding: not in top 10 holders (or unknown)")
-    if dev_rep and dev_rep.get("ok"):
-        if dev_rep["is_brand_new_wallet"]:
-            lines.append("Wallet history: brand new (little/no prior activity)")
-        else:
-            lines.append(
-                f"Wallet history: {dev_rep['txn_count_sampled']} txns seen, "
-                f"~{dev_rep['likely_tokens_created']} look like token creations"
-            )
-    lines.append("_Note: full track record (past rugs vs successful launches) isn't reliably "
-                  "trackable yet - this is a rough proxy from recent wallet activity only, not a real history._")
+            lines.append(f"Dev holds: `{creator_pct:.1f}%`")
+        sm_summary = smart_money.get_summary(safety["creator"])
+        if sm_summary:
+            lines.append(sm_summary)
+        elif dev_rep and dev_rep.get("ok"):
+            if dev_rep["is_brand_new_wallet"]:
+                lines.append("🆕 Brand new wallet")
+            else:
+                lines.append(f"History: {dev_rep['txn_count_sampled']} txns, ~{dev_rep['likely_tokens_created']} creations")
 
-    # --- Top holders, shown raw so you can eyeball sybil patterns yourself ---
     if safety.get("top_holders_list"):
         lines += ["", "*— Top Holders —*"]
         for h in safety["top_holders_list"][:5]:
             addr = h.get("address") or "unknown"
-            short_addr = f"{addr[:4]}...{addr[-4:]}" if addr and len(addr) > 10 else addr
-            tag = " 👤(dev)" if addr == safety.get("creator") else ""
-            lines.append(f"`{short_addr}` - `{h.get('pct', 0):.1f}%`{tag}")
+            short = f"{addr[:4]}...{addr[-4:]}" if len(addr) > 10 else addr
+            tag = " 👤dev" if addr == safety.get("creator") else ""
+            lines.append(f"`{short}` - `{h.get('pct', 0):.1f}%`{tag}")
 
-    # --- Socials, stated explicitly not just as buttons ---
     lines += ["", "*— Socials —*"]
-    lines.append(f"X: {'✅' if info.get('twitter_url') else '❌ none found'}  ·  "
-                 f"Telegram: {'✅' if info.get('telegram_url') else '❌ none found'}  ·  "
-                 f"Website: {'✅' if info.get('website_url') else '❌ none found'}")
-
+    lines.append(f"X: {'✅' if info.get('twitter_url') else '❌'} · TG: {'✅' if info.get('telegram_url') else '❌'} · Web: {'✅' if info.get('website_url') else '❌'}")
     lines.append("")
     lines.append("_This is a PAPER trade - no real funds involved._")
     return "\n".join(lines)
@@ -254,38 +230,233 @@ def format_position_update(mint: str, pos: dict, current_price: float) -> str:
 
     return (
         f"{arrow} *{pos['symbol']}*\n"
-        f"Entry: `${entry:.8f}`  →  Now: `${current_price:.8f}`\n"
+        f"Entry: `${entry:.8f}` → Now: `${current_price:.8f}`\n"
         f"Change: `{change_pct:+.2f}%`\n"
         f"{recommendation}\n"
     )
 
-
-# ---------------- command handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     wallet.apply_daily_topup(user_id)
     balance = wallet.get_balance(user_id)
     await update.message.reply_text(
-        "👋 Welcome to your Solana paper-trading practice bot.\n\n"
+        "👋 *Solana Goldmine Bot* — Paper Trading Mode\n\n"
         f"Fake balance: *{balance:.3f} SOL*\n"
-        f"(+{config.DAILY_TOPUP_SOL} SOL/day, capped at {config.BALANCE_CAP_SOL} SOL)\n\n"
-        "*For instant new-coin discovery:* run `python live_listener.py` in a separate "
-        "terminal (free, uses PumpPortal) - then /new and /graduated show real-time results. "
-        "Without it, they fall back to slower on-demand scans.\n\n"
+        f"(+{config.DAILY_TOPUP_SOL} SOL/day, cap {config.BALANCE_CAP_SOL} SOL)\n\n"
+        "*How to use:*\n"
+        "1. Run `python live_listener.py` in another terminal\n"
+        "2. The bot alerts you when it finds a *goldmine*\n"
+        "3. Tap *APE IN* to paper-buy, or /autopilot for auto-buy\n"
+        "4. Sell manually or let auto-exit handle TP/SL\n\n"
         "*Commands:*\n"
-        "Send a contract address (CA) — check a token's safety, price, and get a Buy button\n"
-        "/balance — see your fake SOL balance\n"
-        "/positions — see open trades with live P&L and a Sell button\n"
-        "/activity — history of every coin you've bought, with peak price and a chart\n"
-        "/stats — your overall win rate and total P&L\n"
-        "/new — brand-new tokens (live if listener running, else on-demand)\n"
-        "/graduated — tokens that just migrated to PumpSwap (live if listener running)\n"
-        "/launching — Raydium CPMM pools with a future open time (rare, separate on-demand check)\n"
-        "/checktx <signature> — debug tool for verifying on-chain detection against a known transaction\n"
-        "/analyse — reply to any message showing a token (from /new, /graduated, etc.) to get the full breakdown\n",
+        "Send a CA — full analysis + conviction score\n"
+        "/bonded — tokens IN bonding curve (earliest stage)\n"
+        "/graduated — tokens that just LEFT the curve\n"
+        "/autopilot — toggle auto paper-buying ON/OFF\n"
+        "/conviction <CA> — check goldmine score\n"
+        "/smartmoney — view tracked dev wallets\n"
+        "/addsmart <wallet> <tag> — manually track a wallet\n"
+        "/balance — fake SOL balance\n"
+        "/positions — open trades with P&L\n"
+        "/activity — trade history with charts\n"
+        "/stats — win rate & total P&L\n"
+        "/new — new tokens\n"
+        "/launching — Raydium delayed pools\n"
+        "/checktx <sig> — debug transaction",
         parse_mode="Markdown",
     )
+
+
+async def bonded_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    live = read_live_discoveries("new_token", max_age_seconds=1800)
+    if not live:
+        await update.message.reply_text(
+            "No live listener data. Run `python live_listener.py` first.\n"
+            "Bonded tokens are caught at creation — this is the earliest possible stage."
+        )
+        return
+
+    bonded = [r for r in live if r.get("bonding_progress") is not None and r["bonding_progress"] < 100]
+    if not bonded:
+        await update.message.reply_text("No bonded tokens found in the last 30 min. Either everything graduated or the listener isn't capturing bonding data.")
+        return
+
+    bonded.sort(key=lambda x: x.get("bonding_progress", 0), reverse=True)
+    shown = bonded[:10]
+    header = (
+        f"🔗 *Bonded Tokens ({len(bonded)} found)*\n"
+        f"_Still in pump.fun bonding curve — earliest stage before graduation_\n\n"
+        f"Showing top {len(shown)} sorted by graduation progress (highest first):"
+    )
+    await update.message.reply_text(header, parse_mode="Markdown")
+
+    for rec in shown:
+        mint = rec.get("mint")
+        if not mint:
+            continue
+        try:
+            card, keyboard, error = await build_token_card(mint)
+            if error:
+                symbol = rec.get("symbol", "?")
+                name = rec.get("name", "?")
+                progress = rec.get("bonding_progress", 0)
+                bar_filled = int(progress / 10)
+                bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+                init_buy = rec.get("initial_buy_sol")
+                is_whale = rec.get("is_whale_launch", False)
+                ago = int(time.time() - rec.get("discovered_at", time.time()))
+                ago_str = f"{ago}s ago" if ago < 60 else format_age(ago // 60) + " ago"
+
+                lines = [
+                    f"*{name} ({symbol})*",
+                    f"`{mint}`",
+                    f"📊 Bonding: {bar} `{progress:.0f}%`",
+                ]
+                if init_buy:
+                    whale_tag = " 🐋" if is_whale else ""
+                    lines.append(f"💰 Initial buy: `{init_buy:.2f} SOL`{whale_tag}")
+                lines.append(f"⏱️ Caught: `{ago_str}`")
+                lines.append("")
+                lines.append("_Too new for full analysis — tap Refresh in a minute._")
+
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{symbol}"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
+                ]])
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
+                continue
+
+            await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            logger.warning(f"Failed bonded card for {mint}: {e}")
+
+
+async def graduated_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    live = read_live_discoveries("migration")
+    if live:
+        shown = live[:8]
+        header = f"🎓 *{len(shown)} graduation(s) caught live*"
+        await update.message.reply_text(header, parse_mode="Markdown")
+        for mig in shown:
+            try:
+                mint = mig.get("mint")
+                if not mint:
+                    continue
+                card, keyboard, error = await build_token_card(mint)
+                if error:
+                    continue
+                ago = format_age(int((time.time() - mig["discovered_at"]) // 60))
+                card = f"🎓 *Graduated ~{ago} ago (live)*\n\n" + card
+                await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
+            except Exception as e:
+                logger.warning(f"Failed graduation card: {e}")
+        return
+
+    await update.message.reply_text(
+        "No live migration data yet. Falling back to on-demand Helius scan...\n"
+        "🎓 Scanning for recent pump.fun → PumpSwap graduations... (20-30s)",
+    )
+
+    result = get_recent_migrations(config.HELIUS_API_KEY, config.SOLANA_RPC_URL, limit=8, lookback=config.LAUNCHING_LOOKBACK)
+    if not result["ok"]:
+        await update.message.reply_text(f"Scan failed: {result['error']}")
+        return
+    if not result["tokens"]:
+        await update.message.reply_text(result.get("note") or "No graduations found in this window.")
+        return
+
+    for mig in result["tokens"]:
+        ago = format_age(mig["seconds_ago"] // 60) if mig.get("seconds_ago") and mig["seconds_ago"] >= 60 else f"{mig.get('seconds_ago', '?')}s"
+        lines = [f"🎓 *Graduated {ago} ago*"]
+        if mig.get("mint") and mig.get("mint_confirmed"):
+            lines.append(f"Mint: `{mig['mint']}`")
+            safety = check_safety(mig["mint"])
+            if safety.get("mint_authority"):
+                lines.append("⚠️ Mint authority active")
+            if safety.get("freeze_authority"):
+                lines.append("⚠️ Freeze authority active")
+            if not safety.get("mint_authority") and not safety.get("freeze_authority"):
+                lines.append("✅ No mint/freeze red flags")
+        elif mig.get("mint"):
+            lines.append(f"Mint: `{mig['mint']}` ⚠️ unconfirmed")
+        else:
+            lines.append("Mint: unknown")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def smartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not smart_money.wallets:
+        await update.message.reply_text(
+            "📭 *Smart Money Tracker* — No wallets tracked yet.\n\n"
+            "The bot auto-tracks dev wallets from your winning trades.\n"
+            "You can also manually add wallets with `/addsmart <wallet> <tag>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["🏆 *Smart Money Tracker*", ""]
+    for wallet_addr, data in sorted(smart_money.wallets.items(), key=lambda x: x[1]["wins"], reverse=True)[:15]:
+        total = data["wins"] + data["losses"]
+        wr = (data["wins"] / total * 100) if total > 0 else 0
+        tags = ", ".join(data.get("tags", []))
+        short = f"{wallet_addr[:6]}...{wallet_addr[-6:]}"
+        lines.append(f"`{short}` — {data['wins']}W/{data['losses']}L ({wr:.0f}%) — `{tags}`")
+
+    lines.append("")
+    lines.append(f"_Total tracked: {len(smart_money.wallets)} wallets_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def addsmart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage: `/addsmart <wallet_address> [tag]`\n"
+            "Example: `/addsmart ABC123... whale_dev`",
+            parse_mode="Markdown",
+        )
+        return
+
+    wallet_addr = context.args[0]
+    tag = context.args[1] if len(context.args) > 1 else "watched"
+    smart_money.add_manual_wallet(wallet_addr, tag)
+    await update.message.reply_text(
+        f"✅ Added `{wallet_addr[:10]}...` with tag `{tag}`",
+        parse_mode="Markdown",
+    )
+
+
+async def autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    current = autopilot_states.get(user_id, False)
+    autopilot_states[user_id] = not current
+    status = "🟢 ON" if autopilot_states[user_id] else "🔴 OFF"
+    await update.message.reply_text(
+        f"🤖 *Autopilot: {status}*\n\n"
+        f"Bot will auto-buy any token scoring ≥{config.AUTO_BUY_THRESHOLD}/100 in paper mode.\n"
+        f"Risk limits: max {risk_mgr.max_concurrent_positions} positions, "
+        f"max ${risk_mgr.max_exposure_per_deployer} per deployer.\n\n"
+        "⚠️ *Still paper trading.* No real money at risk.",
+        parse_mode="Markdown",
+    )
+
+
+async def conviction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /conviction <token_address>")
+        return
+    mint = context.args[0]
+    if not MINT_PATTERN.match(mint):
+        await update.message.reply_text("Invalid Solana address.")
+        return
+    await update.message.reply_text(f"🔎 Analyzing `{mint}`...", parse_mode="Markdown")
+    try:
+        result = conviction.evaluate(mint)
+        card = conviction.format_card(result)
+        await update.message.reply_text(card, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Conviction check failed: {e}")
+        await update.message.reply_text(f"Analysis failed: {e}")
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,7 +475,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for mint, pos in positions.items():
         info = get_token_info(mint)
         if not info["ok"]:
-            await update.message.reply_text(f"{pos['symbol']}: price lookup failed ({info['error']})")
+            await update.message.reply_text(f"{pos['symbol']}: price lookup failed")
             continue
         text = format_position_update(mint, pos, info["price_usd"])
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Sell", callback_data=f"sell:{mint}")]])
@@ -316,8 +487,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = wallet.get_stats(user_id)
     await update.message.reply_text(
         f"📊 *Stats*\n"
-        f"Trades closed: {s['total_trades']}\n"
-        f"Wins: {s['wins']}  Losses: {s['losses']}\n"
+        f"Trades: {s['total_trades']} | Wins: {s['wins']} | Losses: {s['losses']}\n"
         f"Win rate: {s['win_rate']:.1f}%\n"
         f"Total P&L: {s['total_pnl_sol']:+.4f} SOL",
         parse_mode="Markdown",
@@ -325,17 +495,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_price_chart(symbol: str, price_history: list) -> io.BytesIO:
-    """Renders a simple price-over-time line chart to an in-memory PNG."""
     times = [datetime.datetime.fromtimestamp(t) for t, _ in price_history]
     prices = [p for _, p in price_history]
-
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.plot(times, prices, linewidth=2)
     ax.set_title(f"{symbol} price")
     ax.set_ylabel("Price (USD)")
     fig.autofmt_xdate()
     fig.tight_layout()
-
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=120)
     plt.close(fig)
@@ -346,88 +513,60 @@ def build_price_chart(symbol: str, price_history: list) -> io.BytesIO:
 def format_activity_record(rec: dict) -> str:
     entry = rec["entry_price_usd"]
     peak = rec["peak_price_usd"]
-    peak_time = (
-        datetime.datetime.fromtimestamp(rec["peak_timestamp"]).strftime("%H:%M")
-        if rec.get("peak_timestamp") else "?"
-    )
-    opened = (
-        datetime.datetime.fromtimestamp(rec["opened_at"]).strftime("%b %d, %H:%M")
-        if rec.get("opened_at") else "?"
-    )
-
+    peak_time = datetime.datetime.fromtimestamp(rec["peak_timestamp"]).strftime("%H:%M") if rec.get("peak_timestamp") else "?"
+    opened = datetime.datetime.fromtimestamp(rec["opened_at"]).strftime("%b %d, %H:%M") if rec.get("opened_at") else "?"
     lines = [f"*{rec['symbol']}* {'🟢 OPEN' if rec['is_open'] else '⚪ CLOSED'}"]
     lines.append(f"Bought: `{opened}` at `${entry:.8f}`")
     lines.append(f"Peak: `${peak:.8f}` (`{rec['peak_gain_pct']:+.1f}%`) at `{peak_time}`")
-
     if rec["is_open"]:
-        lines.append("_Still open - check /positions for live P&L_")
+        lines.append("_Still open - check /positions_")
     else:
-        lines.append(f"Sold at: `${rec['exit_price_usd']:.8f}`")
+        lines.append(f"Sold: `${rec['exit_price_usd']:.8f}`")
         lines.append(f"Result: `{rec['pnl_sol']:+.4f} SOL` (`{rec['pnl_percent']:+.1f}%`)")
-        # The "what if you'd sold at the peak instead" comparison
         if rec["peak_gain_pct"] > (rec["pnl_percent"] or 0) + 1:
             missed = rec["peak_gain_pct"] - (rec["pnl_percent"] or 0)
-            lines.append(f"_If sold at peak instead: +{missed:.1f}% more_")
-
+            lines.append(f"_If sold at peak: +{missed:.1f}% more_")
     return "\n".join(lines)
 
 
 async def activity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     records = wallet.get_activity_records(user_id)
-
     if not records:
-        await update.message.reply_text("No activity yet. Send a CA and tap Buy to get started.")
+        await update.message.reply_text("No activity yet.")
         return
-
-    for rec in records[:10]:  # most recent 10, so this doesn't turn into a wall of messages
+    for rec in records[:10]:
         text = format_activity_record(rec)
         await update.message.reply_text(text, parse_mode="Markdown")
-
         if len(rec.get("price_history", [])) >= 2:
             try:
                 chart = build_price_chart(rec["symbol"], rec["price_history"])
                 await update.message.reply_photo(photo=chart)
             except Exception as e:
-                logger.warning(f"Chart render failed for {rec['symbol']}: {e}")
+                logger.warning(f"Chart failed: {e}")
 
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Live listener (PumpPortal, free) is the best source when running -
-    # genuinely real-time, not a REST snapshot that can lag.
     live_new = read_live_discoveries("new_token", max_age_seconds=600)
     if live_new:
         shown = live_new[:8]
-        if len(live_new) > len(shown):
-            await update.message.reply_text(
-                f"🆕 *{len(live_new)} brand-new token(s) caught live - showing the {len(shown)} most recent (PumpPortal)*",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(f"🆕 *{len(shown)} brand-new token(s) caught live (PumpPortal)*", parse_mode="Markdown")
+        await update.message.reply_text(f"🆕 *{len(shown)} brand-new token(s) caught live*", parse_mode="Markdown")
         for t in shown:
             try:
                 card, keyboard, error = await build_token_card(t["mint"])
                 if error:
-                    logger.warning(f"Auto-analysis failed for {t.get('mint')}: {error}")
                     continue
                 await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
             except Exception as e:
-                logger.warning(f"Failed to send new-token entry for {t.get('mint')}: {e}")
+                logger.warning(f"Failed new-token card: {e}")
     else:
-        await update.message.reply_text(
-            "No live listener data yet (run live_listener.py for instant results) - "
-            "falling back to on-demand scan.\n"
-            "🔎 Scanning for genuinely new Solana tokens...",
-        )
+        await update.message.reply_text("No live listener data. Falling back to on-demand scan...")
 
-    # PRIMARY (fallback) section: only runs if the live listener has
-    # nothing yet - avoids showing two different "new tokens" lists at once.
     if not live_new:
         latest = get_latest_new_tokens(config.SOLANATRACKER_API_KEY, limit=8)
         if latest["ok"] and latest["tokens"]:
-            window_label = f"last {latest['window_used_minutes']} min" if latest.get("window_used_minutes") else "age unknown"
-            lines = [f"🆕 *Genuinely New Tokens ({window_label})*", ""]
+            window = f"last {latest['window_used_minutes']} min" if latest.get("window_used_minutes") else "age unknown"
+            lines = [f"🆕 *New Tokens ({window})*", ""]
             if latest.get("note"):
                 lines.append(f"_{latest['note']}_")
                 lines.append("")
@@ -438,15 +577,11 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("")
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            err = latest.get("error", "no results")
-            await update.message.reply_text(f"New-token feed unavailable right now ({err}).")
+            await update.message.reply_text(f"Feed unavailable ({latest.get('error', 'no results')}).")
 
-    # SEPARATE section: boosted/promoted listings - these are PAID
-    # placements, not necessarily new. Kept distinct on purpose so it's
-    # never confused with the section above again.
     boosted = get_boosted_solana_tokens(limit=5)
     if boosted["ok"] and boosted["tokens"]:
-        lines = ["📢 *Currently Promoted (paid placement, NOT necessarily new)*", ""]
+        lines = ["📢 *Promoted (paid placement)*", ""]
         for t in boosted["tokens"]:
             desc = (t["description"][:60] + "...") if len(t.get("description", "")) > 60 else t.get("description", "")
             lines.append(f"`{t['mint']}`")
@@ -457,72 +592,45 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     graduating = get_graduating_coins(api_key=config.SOLANATRACKER_API_KEY, limit=8)
     if graduating["ok"] and graduating["tokens"]:
-        lines = ["⏳ *Nearing Graduation to PumpSwap (SolanaTracker)*", ""]
+        lines = ["⏳ *Nearing Graduation*", ""]
         for t in graduating["tokens"]:
             bar_filled = int(t["graduation_progress_pct"] / 10)
             bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
             age_str = format_age(t["age_minutes"]) if t.get("age_minutes") is not None else "unknown"
-            lines.append(f"*{t['symbol']}* - `${t['mcap_usd']:,.0f}` mcap  ·  Age: `{age_str}`")
+            lines.append(f"*{t['symbol']}* - `${t['mcap_usd']:,.0f}` mcap · Age: `{age_str}`")
             lines.append(f"{bar} `{t['graduation_progress_pct']:.0f}%` to PumpSwap")
             lines.append(f"`{t['mint']}`")
             lines.append("")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    else:
-        logger.info(f"Graduating-coins scan unavailable: {graduating.get('error')}")
 
 
 async def checktx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /checktx <transaction_signature>\n\n"
-            "For a Raydium pool creation: search CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C on "
-            "Solscan, find a transaction labeled Initialize.\n"
-            "For a pump.fun graduation: search 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P on "
-            "Solscan, find a transaction labeled Migrate.\n"
-            "Copy either one's signature and send it here."
-        )
+        await update.message.reply_text("Usage: /checktx <signature>")
         return
-
     signature = context.args[0]
-    await update.message.reply_text(f"🔎 Checking transaction `{signature}`...", parse_mode="Markdown")
-
+    await update.message.reply_text(f"🔎 Checking `{signature}`...", parse_mode="Markdown")
     result = debug_check_transaction(signature, config.HELIUS_API_KEY)
     if not result["ok"]:
-        await update.message.reply_text(f"Couldn't fetch that transaction: {result['error']}")
+        await update.message.reply_text(f"Couldn't fetch: {result['error']}")
         return
-
     if result["matching_instructions_found"] == 0:
-        await update.message.reply_text(
-            f"Tx type (per Helius): `{result['tx_type']}`\n"
-            "No CPMM or pump.fun program instructions found in this transaction at all - "
-            "make sure this signature actually touches one of those programs."
-        )
+        await update.message.reply_text("No CPMM or pump.fun instructions found.")
         return
-
-    lines = [f"Tx type: `{result['tx_type']}`", f"Matching instructions found: {result['matching_instructions_found']}", ""]
+    lines = [f"Tx type: `{result['tx_type']}`", f"Matches: {result['matching_instructions_found']}", ""]
     for i, f in enumerate(result["findings"], 1):
         lines.append(f"*Instruction {i} ({f.get('program', '?')}):*")
         lines.append(f"  Discriminator: `{f.get('discriminator_hex', 'n/a')}`")
         lines.append(f"  Matched: `{f.get('matched_instruction', 'n/a')}`")
         if "decoded_open_time_readable" in f:
-            lines.append(f"  Decoded open_time: `{f['decoded_open_time_readable']}`")
-            lines.append(f"  Tx happened at: `{f.get('tx_timestamp_readable', '?')}`")
-            lines.append(f"  Gap (open_time - tx_time): `{f.get('seconds_from_tx_to_open_time', '?')}s`")
+            lines.append(f"  Open time: `{f['decoded_open_time_readable']}`")
         if "extracted_mint" in f:
-            lines.append(f"  Extracted mint: `{f.get('extracted_mint', 'n/a')}`")
-            lines.append(f"  Mint confirmed (ends in 'pump'): `{f.get('mint_confirmed')}`")
+            lines.append(f"  Mint: `{f.get('extracted_mint', 'n/a')}`")
         lines.append("")
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 def read_live_discoveries(event_type: str, max_age_seconds: int = 3600) -> list:
-    """
-    Reads recent entries from live_discoveries.jsonl (written by
-    live_listener.py, if it's running). Returns [] if the file doesn't
-    exist or has nothing recent - callers should fall back to the
-    on-demand scan in that case.
-    """
     import json as _json
     import os as _os
     path = "live_discoveries.jsonl"
@@ -547,140 +655,35 @@ def read_live_discoveries(event_type: str, max_age_seconds: int = 3600) -> list:
     return results
 
 
-async def graduated_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Live feed of tokens that just graduated from pump.fun to PumpSwap (the real, current graduation mechanism)."""
-    live = read_live_discoveries("migration")
-    if live:
-        shown = live[:8]
-        if len(live) > len(shown):
-            await update.message.reply_text(
-                f"🎓 {len(live)} graduation(s) caught live - showing the {len(shown)} most recent:"
-            )
-        else:
-            await update.message.reply_text(f"🎓 {len(shown)} graduation(s) caught live by the listener:")
-        for mig in shown:
-            try:
-                mint = mig.get("mint")
-                if not mint:
-                    continue
-                card, keyboard, error = await build_token_card(mint)
-                if error:
-                    logger.warning(f"Auto-analysis failed for {mint}: {error}")
-                    continue
-                ago = format_age(int((time.time() - mig["discovered_at"]) // 60))
-                card = f"🎓 *Graduated ~{ago} ago (live)*\n\n" + card
-                await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
-            except Exception as e:
-                logger.warning(f"Failed to send graduation entry for {mig.get('mint')}: {e}")
-        return
-
-    await update.message.reply_text(
-        "No live listener running (or nothing caught yet) - falling back to on-demand scan.\n"
-        "🎓 Scanning for recent pump.fun -> PumpSwap graduations... (this may take 20-30s)",
-    )
-
-    result = get_recent_migrations(config.HELIUS_API_KEY, config.SOLANA_RPC_URL, limit=8, lookback=config.LAUNCHING_LOOKBACK)
-
-    if not result["ok"]:
-        await update.message.reply_text(f"Couldn't scan for graduations: {result['error']}")
-        return
-
-    if not result["tokens"]:
-        await update.message.reply_text(result.get("note") or "No graduations found in this window.")
-        return
-
-    for mig in result["tokens"]:
-        ago = format_age(mig["seconds_ago"] // 60) if mig["seconds_ago"] and mig["seconds_ago"] >= 60 else f"{mig.get('seconds_ago', '?')}s"
-        lines = [f"🎓 *Graduated {ago} ago*"]
-
-        if mig.get("mint") and mig.get("mint_confirmed"):
-            lines.append(f"Mint: `{mig['mint']}`")
-            safety = check_safety(mig["mint"])
-            if safety.get("mint_authority"):
-                lines.append("⚠️ Mint authority still active")
-            if safety.get("freeze_authority"):
-                lines.append("⚠️ Freeze authority still active")
-            if not safety.get("mint_authority") and not safety.get("freeze_authority"):
-                lines.append("✅ No mint/freeze authority red flags")
-        elif mig.get("mint"):
-            lines.append(f"Mint: `{mig['mint']}` ⚠️ _unconfirmed - doesn't match pump.fun's usual address pattern, verify on Solscan before trusting_")
-        else:
-            lines.append("Mint: unknown (couldn't extract from this transaction)")
-
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
 async def launching_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    live = read_live_discoveries("cpmm_creation")
-    live_future = [r for r in live if r.get("is_future")]
-    if live_future:
-        await update.message.reply_text(f"⏰ {len(live_future)} delayed-open pool(s) caught live:")
-        for pool in live_future[:8]:
-            when = datetime.datetime.fromtimestamp(pool["open_timestamp"]).strftime("%Y-%m-%d %H:%M")
-            await update.message.reply_text(
-                f"⏰ *Opens at {when}* (caught live, not a decode guess)\n"
-                f"Signature: `{pool.get('signature', 'unknown')}`",
-                parse_mode="Markdown",
-            )
-        return
-
-    await update.message.reply_text(
-        "No live listener running (or nothing caught yet) - falling back to on-demand scan.\n"
-        "🔎 Scanning for Raydium CPMM pools with a future open time... "
-        "(this may take 20-30s - NOTE: since March 2025 most pump.fun graduations go to "
-        "PumpSwap, not Raydium, so this specifically only catches manual/direct Raydium "
-        "launches, which are less common now. Try /graduated for the more common path.)\n",
-    )
-
     result = get_upcoming_pool_launches(config.HELIUS_API_KEY, config.SOLANA_RPC_URL, limit=8, lookback=config.LAUNCHING_LOOKBACK)
-
     if not result["ok"]:
-        await update.message.reply_text(f"Couldn't scan for upcoming launches: {result['error']}")
+        await update.message.reply_text(f"Scan failed: {result['error']}")
         return
-
     if not result["tokens"]:
-        await update.message.reply_text(result.get("note") or "No upcoming launches found right now.")
+        await update.message.reply_text(result.get("note") or "No upcoming launches found.")
         return
-
     for pool in result["tokens"]:
         secs = pool["seconds_until_open"]
         countdown = format_age(secs // 60) if secs >= 60 else f"{secs}s"
-
-        lines = [
-            f"⏰ *Opens in ~{countdown}* ⚠️ _unverified decode - check manually before trusting_",
-            f"Mint: `{pool['mint'] or 'unknown'}`",
-            f"Pool: `{pool['pool_address'] or 'unknown'}`",
-        ]
-
-        # Pull the same research you'd want before buying anything else
+        lines = [f"⏰ *Opens in ~{countdown}*", f"Mint: `{pool['mint'] or 'unknown'}`", f"Pool: `{pool['pool_address'] or 'unknown'}`"]
         if pool.get("creator"):
             dev_rep = get_deployer_reputation(pool["creator"], config.HELIUS_API_KEY)
             if dev_rep.get("ok"):
                 if dev_rep["is_brand_new_wallet"]:
-                    lines.append("👤 Dev wallet: brand new (little/no history)")
+                    lines.append("👤 Dev: brand new wallet")
                 else:
-                    lines.append(
-                        f"👤 Dev wallet: {dev_rep['txn_count_sampled']} txns, "
-                        f"~{dev_rep['likely_tokens_created']} look like token creations"
-                    )
-
+                    lines.append(f"👤 Dev: {dev_rep['txn_count_sampled']} txns, ~{dev_rep['likely_tokens_created']} creations")
         if pool.get("mint"):
             safety = check_safety(pool["mint"])
             if safety.get("mint_authority"):
-                lines.append("⚠️ Mint authority still active")
+                lines.append("⚠️ Mint authority active")
             if safety.get("freeze_authority"):
-                lines.append("⚠️ Freeze authority still active")
-            if not safety.get("mint_authority") and not safety.get("freeze_authority"):
-                lines.append("✅ No mint/freeze authority red flags")
-
+                lines.append("⚠️ Freeze authority active")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 def get_raw_creation_record(mint: str) -> dict:
-    """Returns the raw PumpPortal 'new_token' record our own listener
-    captured at creation, if any - used as a fallback when DexScreener
-    hasn't indexed a trading pair yet (very common for tokens seconds old,
-    exactly the case /analyse is often used for)."""
     import json as _json
     import os as _os
     def _search(path):
@@ -697,71 +700,62 @@ def get_raw_creation_record(mint: str) -> dict:
         except (IOError, _json.JSONDecodeError):
             return None
         return None
-
     return _search("launch_index.jsonl") or _search("live_discoveries.jsonl")
 
 
-def format_minimal_card(mint: str, raw_record: dict, sol_price_usd: float, safety: dict = None) -> str:
-    """Fallback card built from our own captured creation data, for when
-    DexScreener hasn't indexed this token yet (common for very fresh
-    tokens - which is exactly when /analyse tends to get used)."""
+def format_minimal_card(mint: str, raw_record: dict, sol_price_usd: float, safety: dict = None, eval_result: dict = None) -> str:
     raw = raw_record.get("raw", {})
     name = raw.get("name") or raw_record.get("name") or "?"
     symbol = raw.get("symbol") or raw_record.get("symbol") or "?"
-
-    lines = [
-        f"*{name} ({symbol})*",
-        f"`{mint}`",
-        "",
-        "_⚠️ Too new for DexScreener yet - showing what was captured at creation. "
-        "Try /analyse again in a minute for full price/liquidity data._",
-        "",
-    ]
-
+    lines = [f"*{name} ({symbol})*", f"`{mint}`", "", "_⚠️ Too new for DexScreener - showing creation data._", ""]
+    if eval_result:
+        e = eval_result
+        lines.append(f"{e['verdict_emoji']} *Conviction: {e['score']:.0f}/100* — `{e['verdict']}`")
+        if e.get("bonding_progress") is not None:
+            bar_filled = int(e["bonding_progress"] / 10)
+            bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+            lines.append(f"📊 Bonding: {bar} `{e['bonding_progress']:.0f}%`")
+        lines.append("")
     v_sol = raw.get("vSolInBondingCurve")
     v_tokens = raw.get("vTokensInBondingCurve")
     if v_sol and v_tokens and sol_price_usd > 0:
         launch_price = (v_sol / v_tokens) * sol_price_usd
         lines.append(f"Launch price: `${launch_price:.8f}`")
     if raw.get("marketCapSol") and sol_price_usd > 0:
-        lines.append(f"Market Cap at creation: `${raw['marketCapSol'] * sol_price_usd:,.0f}`")
+        lines.append(f"MCap at creation: `${raw['marketCapSol'] * sol_price_usd:,.0f}`")
     if raw.get("solAmount"):
         lines.append(f"Initial buy: `{raw['solAmount']:.3f} SOL`")
-
     ago = int(time.time() - raw_record.get("discovered_at", time.time()))
     ago_str = f"{ago}s ago" if ago < 60 else format_age(ago // 60) + " ago"
     lines.append(f"Caught: `{ago_str}`")
-
     if safety:
         lines.append("")
         lines.append("*— Contract —*")
-        min_check_failed = not safety.get("is_safe") and "API check failed" in str(safety.get("reason", ""))
-        contract_line = "✅ Contract looks safe" if safety.get("is_safe") else f"❌ Contract UNSAFE ({safety.get('reason')})"
+        check_failed = not safety.get("is_safe") and "API check failed" in str(safety.get("reason", ""))
+        contract_line = "✅ Safe" if safety.get("is_safe") else f"❌ UNSAFE ({safety.get('reason')})"
         lines.append(contract_line)
-        if min_check_failed:
-            lines.append("Renounced: ⚫ Unknown (check failed)")
+        if check_failed:
+            lines.append("Renounced: ⚫ Unknown")
         else:
-            renounced = not safety.get("mint_authority")
-            lines.append(f"Renounced: {'✅' if renounced else '❌ Mint authority still active'}")
+            lines.append(f"Renounced: {'✅' if not safety.get('mint_authority') else '❌ Mint active'}")
         if safety.get("freeze_authority"):
-            lines.append("❌ Freeze authority still active")
-
+            lines.append("❌ Freeze active")
     lines.append("")
     lines.append("_This is a PAPER trade - no real funds involved._")
     return "\n".join(lines)
 
 
 async def build_token_card(mint: str):
-    """Builds the (card_text, keyboard) pair for a token - shared by
-    handle_ca and the Refresh button so both stay in sync."""
     info = get_token_info(mint)
     if not info["ok"]:
         raw_record = get_raw_creation_record(mint)
         if raw_record:
             sol_price = get_sol_usd_price()
-            safety = check_safety(mint)  # doesn't depend on DexScreener, try it anyway
-            card = format_minimal_card(mint, raw_record, sol_price, safety)
+            safety = check_safety(mint)
+            eval_result = conviction.evaluate(mint, live_record=raw_record, safety=safety)
+            card = format_minimal_card(mint, raw_record, sol_price, safety, eval_result)
             keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{raw_record.get('symbol', '?')}"),
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
             ]])
             return card, keyboard, None
@@ -772,16 +766,22 @@ async def build_token_card(mint: str):
     if safety.get("creator"):
         dev_rep = get_deployer_reputation(safety["creator"], config.HELIUS_API_KEY)
 
+    live_rec = get_raw_creation_record(mint)
+    eval_result = conviction.evaluate(mint, live_record=live_rec, safety=safety, dev_rep=dev_rep, info=info)
+
     sol_price = get_sol_usd_price()
     launch = get_launch_price(mint, sol_price) if sol_price > 0 else {"ok": False}
 
-    card = format_token_card(mint, info, safety, dev_rep, launch)
+    card = format_token_card(mint, info, safety, dev_rep, launch, eval_result)
 
-    keyboard_rows = [[
-        InlineKeyboardButton(f"Buy {config.DEFAULT_BUY_SIZE_SOL} SOL", callback_data=f"buy:{mint}:{info['symbol']}"),
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
-    ]]
+    buttons = []
+    if eval_result["score"] >= config.GOLDMINE_ALERT_THRESHOLD:
+        buttons.append(InlineKeyboardButton(f"🚀 APE IN ({config.DEFAULT_BUY_SIZE_SOL} SOL)", callback_data=f"buy:{mint}:{info['symbol']}"))
+    else:
+        buttons.append(InlineKeyboardButton(f"Buy {config.DEFAULT_BUY_SIZE_SOL} SOL", callback_data=f"buy:{mint}:{info['symbol']}"))
+    buttons.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"))
 
+    keyboard_rows = [buttons]
     link_row = []
     if info.get("twitter_url"):
         link_row.append(InlineKeyboardButton("𝕏", url=info["twitter_url"]))
@@ -798,25 +798,18 @@ async def build_token_card(mint: str):
 async def analyse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied = update.message.reply_to_message
     if not replied or not replied.text:
-        await update.message.reply_text(
-            "Reply to a message that shows a token (e.g. one from /new or /graduated) "
-            "with /analyse to get the full breakdown for that coin."
-        )
+        await update.message.reply_text("Reply to a message containing a token address with /analyse.")
         return
-
     match = MINT_SEARCH_PATTERN.search(replied.text)
     if not match:
-        await update.message.reply_text("Couldn't find a token address in that message.")
+        await update.message.reply_text("No token address found in that message.")
         return
-
     mint = match.group(0)
     await update.message.reply_text(f"🔎 Analysing `{mint}`...", parse_mode="Markdown")
-
     card, keyboard, error = await build_token_card(mint)
     if error:
-        await update.message.reply_text(f"Couldn't analyse that token: {error}")
+        await update.message.reply_text(f"Couldn't analyse: {error}")
         return
-
     await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -825,19 +818,14 @@ async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not MINT_PATTERN.match(text):
         await update.message.reply_text("That doesn't look like a token address. Send a valid Solana CA.")
         return
-
     mint = text
-    await update.message.reply_text("🔎 Checking token...")
-
+    await update.message.reply_text("🔎 Checking token + calculating conviction...")
     card, keyboard, error = await build_token_card(mint)
     if error:
-        await update.message.reply_text(f"Couldn't find price data: {error}")
+        await update.message.reply_text(f"Couldn't find data: {error}")
         return
-
     await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
 
-
-# ---------------- button handlers ----------------
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -859,9 +847,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_token_info(mint)
         sol_price = get_sol_usd_price()
         if not info["ok"] or sol_price <= 0:
-            await query.message.reply_text("Price data unavailable right now, try again shortly.")
+            await query.message.reply_text("Price data unavailable, try again shortly.")
             return
-
         result = wallet.buy(
             user_id, mint, symbol,
             sol_amount=config.DEFAULT_BUY_SIZE_SOL,
@@ -871,10 +858,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not result["ok"]:
             await query.message.reply_text(f"❌ {result['error']}")
             return
-
         await query.message.reply_text(
             f"✅ Bought *{symbol}* with {config.DEFAULT_BUY_SIZE_SOL} SOL\n"
-            f"Entry price: `${info['price_usd']:.8f}`\n"
+            f"Entry: `${info['price_usd']:.8f}`\n"
             f"New balance: {wallet.get_balance(user_id):.3f} SOL",
             parse_mode="Markdown",
         )
@@ -884,25 +870,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_token_info(mint)
         sol_price = get_sol_usd_price()
         if not info["ok"] or sol_price <= 0:
-            await query.message.reply_text("Price data unavailable right now, try again shortly.")
+            await query.message.reply_text("Price data unavailable, try again shortly.")
             return
-
         result = wallet.sell(user_id, mint, info["price_usd"], sol_price)
         if not result["ok"]:
             await query.message.reply_text(f"❌ {result['error']}")
             return
 
+        safety = check_safety(mint)
+        dev_wallet = safety.get("creator")
+        if dev_wallet:
+            smart_money.record_trade(dev_wallet, result["symbol"], result["pnl_sol"], mint)
+
         emoji = "🟢" if result["pnl_sol"] >= 0 else "🔴"
         await query.message.reply_text(
             f"{emoji} Sold *{result['symbol']}*\n"
-            f"Entry: `${result['entry_price_usd']:.8f}`  →  Exit: `${result['exit_price_usd']:.8f}`\n"
+            f"Entry: `${result['entry_price_usd']:.8f}` → Exit: `${result['exit_price_usd']:.8f}`\n"
             f"P&L: `{result['pnl_sol']:+.4f} SOL` (`{result['pnl_percent']:+.2f}%`)\n"
             f"New balance: {wallet.get_balance(user_id):.3f} SOL",
             parse_mode="Markdown",
         )
 
-
-# ---------------- background job: live position updates ----------------
 
 async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
     sol_price = get_sol_usd_price()
@@ -924,7 +912,104 @@ async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=int(user_id), text=text, parse_mode="Markdown", reply_markup=keyboard
                 )
             except Exception as e:
-                logger.warning(f"Failed to push update to {user_id}: {e}")
+                logger.warning(f"Failed push update to {user_id}: {e}")
+
+
+async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
+    sol_price = get_sol_usd_price()
+    if sol_price <= 0:
+        return
+    for user_id, user_data in list(wallet.users.items()):
+        positions = user_data.get("open_positions", {})
+        if not positions:
+            continue
+        for mint, pos in list(positions.items()):
+            info = get_token_info(mint)
+            if not info["ok"]:
+                continue
+            entry = pos["entry_price_usd"]
+            current = info["price_usd"]
+            change = (current - entry) / entry * 100 if entry > 0 else 0
+            if change >= config.TAKE_PROFIT_PERCENT:
+                result = wallet.sell(user_id, mint, current, sol_price)
+                if result["ok"]:
+                    safety = check_safety(mint)
+                    dev_wallet = safety.get("creator")
+                    if dev_wallet:
+                        smart_money.record_trade(dev_wallet, result["symbol"], result["pnl_sol"], mint)
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(f"🎯 *AUTO TAKE PROFIT* — {result['symbol']}\n"
+                              f"Sold at `{change:+.1f}%` (+{config.TAKE_PROFIT_PERCENT}%)\n"
+                              f"P&L: `{result['pnl_sol']:+.4f} SOL`"),
+                        parse_mode="Markdown",
+                    )
+            elif change <= config.STOP_LOSS_PERCENT:
+                result = wallet.sell(user_id, mint, current, sol_price)
+                if result["ok"]:
+                    safety = check_safety(mint)
+                    dev_wallet = safety.get("creator")
+                    if dev_wallet:
+                        smart_money.record_trade(dev_wallet, result["symbol"], result["pnl_sol"], mint)
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=(f"🛑 *AUTO STOP LOSS* — {result['symbol']}\n"
+                              f"Sold at `{change:+.1f}%` ({config.STOP_LOSS_PERCENT}%)\n"
+                              f"P&L: `{result['pnl_sol']:+.4f} SOL`"),
+                        parse_mode="Markdown",
+                    )
+
+
+async def goldmine_scanner(context: ContextTypes.DEFAULT_TYPE):
+    goldmines = auto_trader.scan_for_goldmines(max_lines=200)
+    if not goldmines:
+        return
+    for eval_result in goldmines:
+        score = eval_result["score"]
+        mint = eval_result["mint"]
+        for user_id in list(wallet.users.keys()):
+            try:
+                alert_lines = [
+                    f"🚨 *GOLDMINE DETECTED* 🚨",
+                    f"",
+                    f"{eval_result['verdict_emoji']} *{eval_result['verdict']}* — Score: `{score:.0f}/100`",
+                    f"`{mint}`",
+                    f"",
+                ]
+                for cat, notes in eval_result["notes"].items():
+                    for note in notes:
+                        if any(x in note for x in ["🎯", "❌", "🐋", "🔴", "🟠", "🎭"]):
+                            alert_lines.append(note)
+                if eval_result.get("bonding_progress") is not None:
+                    bar_filled = int(eval_result["bonding_progress"] / 10)
+                    bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+                    alert_lines.append(f"📊 Bonding: {bar} `{eval_result['bonding_progress']:.0f}%`")
+                info = eval_result.get("info", {})
+                if info and info.get("ok"):
+                    alert_lines.append(f"💰 Price: `${info['price_usd']:.8f}` | Liq: `${info['liquidity_usd']:,.0f}`")
+                alert_lines.append("")
+                alert_lines.append("_Paper trading only. Tap APE IN to buy with fake SOL._")
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{info.get('symbol', '?') if info else '?'}")
+                ]])
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text="\n".join(alert_lines),
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                if autopilot_states.get(user_id, False) and score >= config.AUTO_BUY_THRESHOLD:
+                    buy_result = auto_trader.attempt_paper_buy(user_id, eval_result)
+                    if buy_result["ok"]:
+                        await context.bot.send_message(
+                            chat_id=int(user_id),
+                            text=(f"🤖 *AUTO-PILOT BUY* — {info.get('symbol', '?') if info else '?'}\n"
+                                  f"Score: `{score:.0f}/100` ≥ {config.AUTO_BUY_THRESHOLD} threshold\n"
+                                  f"Spent: `{config.DEFAULT_BUY_SIZE_SOL} SOL` (paper)"),
+                            parse_mode="Markdown",
+                        )
+            except Exception as e:
+                logger.warning(f"Goldmine alert failed for user {user_id}: {e}")
 
 
 async def daily_topup_job(context: ContextTypes.DEFAULT_TYPE):
@@ -933,67 +1018,53 @@ async def daily_topup_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def start_keepalive_server():
-    """
-    Minimal HTTP server so Render's free tier treats this as a 'web
-    service' (which is free) instead of a 'background worker' (which
-    isn't). Runs in a background thread; an external pinger (e.g.
-    UptimeRobot, free) hits this URL every few minutes to keep the
-    service from sleeping. Does nothing on your own PC - harmless there.
-    """
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import os
-
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Solana paper bot is alive")
-
+            self.wfile.write(b"Solana goldmine bot is alive")
         def log_message(self, format, *args):
-            pass  # suppress noisy request logs
-
-    port = int(os.environ.get("PORT", 8080))  # Render sets $PORT automatically
+            pass
+    port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(f"Keep-alive HTTP server listening on port {port}")
+    logger.info(f"Keep-alive HTTP server on port {port}")
 
 
 async def start_live_listener_task(application):
-    """
-    Runs live_listener.listen() as a background task IN THIS SAME PROCESS,
-    so it shares memory/disk with the bot - fixes the two-separate-Render-
-    services problem, where live_discoveries.jsonl written by one service
-    was invisible to the other. Now there's only one process, one disk,
-    same as running both scripts locally in the same folder.
-    """
     asyncio.create_task(live_listener.listen())
-    logger.info("Started PumpPortal live listener as a background task.")
+    logger.info("Started PumpPortal live listener as background task.")
 
 
 def main():
     start_keepalive_server()
-
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(start_live_listener_task).build()
-
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bonded", bonded_cmd))
+    app.add_handler(CommandHandler("graduated", graduated_cmd))
+    app.add_handler(CommandHandler("autopilot", autopilot_cmd))
+    app.add_handler(CommandHandler("conviction", conviction_cmd))
+    app.add_handler(CommandHandler("smartmoney", smartmoney_cmd))
+    app.add_handler(CommandHandler("addsmart", addsmart_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("activity", activity_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("launching", launching_cmd))
-    app.add_handler(CommandHandler("graduated", graduated_cmd))
     app.add_handler(CommandHandler("checktx", checktx_cmd))
     app.add_handler(CommandHandler(["analyse", "analysis"], analyse_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca))
-
     job_queue = app.job_queue
     job_queue.run_repeating(push_position_updates, interval=config.PRICE_UPDATE_INTERVAL_SECONDS, first=30)
-    job_queue.run_repeating(daily_topup_job, interval=3600, first=10)  # checked hourly, only applies once/day
-
-    logger.info("Bot starting...")
+    job_queue.run_repeating(auto_exit_checker, interval=60, first=60)
+    job_queue.run_repeating(goldmine_scanner, interval=30, first=15)
+    job_queue.run_repeating(daily_topup_job, interval=3600, first=10)
+    logger.info("Goldmine bot starting...")
     app.run_polling()
 
 

@@ -2,27 +2,11 @@
 live_listener.py - Free, real-time listener for new pump.fun token
 creations and migrations, using PumpPortal's public WebSocket.
 
-WHY THIS REPLACES THE HELIUS APPROACH: PumpPortal is a purpose-built
-third-party API specifically for pump.fun (confirmed via their own
-official docs + multiple independent tutorials, all consistent). It does
-all the on-chain parsing for us and hands back plain JSON - no Anchor
-discriminators, no byte-offset decoding, no RPC account lookups needed.
-subscribeNewToken and subscribeMigration are BOTH FREE, no API key
-required. This is dramatically simpler than the Helius WebSocket +
-manual event-decoding approach, and costs nothing.
-
-HONESTY NOTE: the subscribe request format below is verified against
-PumpPortal's own official documentation (pumpportal.fun/data-api/real-time)
-and matches multiple independent tutorials exactly - high confidence.
-The exact full set of response fields isn't 100% confirmed beyond "mint"
-being present (confirmed via a working example bot's source code) - so
-this logs the raw shape of the first few messages of each type to your
-console, same safety net as before, in case any other field names need
-adjusting once you see real data.
-
-Run:
-    pip install -r requirements.txt
-    python live_listener.py
+UPGRADES in this version:
+  - Bonding curve progress calculation (for graduation sniping)
+  - Initial buy / whale launch detection
+  - Dev wallet freshness flag
+  - Stores richer metadata for conviction_engine.py
 """
 
 import asyncio
@@ -38,22 +22,23 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://pumpportal.fun/api/data"
 DISCOVERIES_FILE = "live_discoveries.jsonl"
-LAUNCH_INDEX_FILE = "launch_index.jsonl"   # separate, more generously-capped store just for launch-price lookups
-MAX_LAUNCH_INDEX = 10000                    # much higher cap - these records are small, and this is what /analyse relies on
+LAUNCH_INDEX_FILE = "launch_index.jsonl"
+MAX_LAUNCH_INDEX = 10000
 
 _debug_logged = {}
 _debug_limit = 3
 
-MAX_DISCOVERIES = 2000        # keep at most this many recent entries
-TRIM_CHECK_EVERY = 100        # only check/trim every N writes, not every single one
+MAX_DISCOVERIES = 2000
+TRIM_CHECK_EVERY = 100
 _write_count = 0
+
+# Bonding curve thresholds (PumpPortal vSolInBondingCurve)
+BONDING_START_SOL = 30.0
+BONDING_GRADUATE_SOL = 85.0
+WHALE_THRESHOLD_SOL = 5.0
 
 
 def _trim_discoveries_file():
-    """Keeps only the most recent MAX_DISCOVERIES lines. Prevents the file
-    from growing forever, which was very likely eating memory/CPU on
-    Render's free tier over hours of continuous running and causing the
-    process to eventually die."""
     if not os.path.exists(DISCOVERIES_FILE):
         return
     try:
@@ -81,10 +66,6 @@ def _trim_launch_index():
 
 
 def _log_launch_index(record: dict):
-    """Separate, more generously-sized store just for launch-price lookups
-    (/analyse relies on this). Kept apart from the general discoveries
-    feed so busy periods don't evict a token's launch data before you get
-    a chance to check it."""
     with open(LAUNCH_INDEX_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
     global _write_count
@@ -97,11 +78,21 @@ def _log_discovery(record: dict):
     record["discovered_at"] = time.time()
     with open(DISCOVERIES_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
-    logger.info(f"DISCOVERY: {record.get('type')} - mint={record.get('mint')}")
-
+    logger.info(f"DISCOVERY: {record.get('type')} - mint={record.get('mint')} "
+                f"score={record.get('conviction_score', 'N/A')} "
+                f"bonding={record.get('bonding_progress', 'N/A'):.0f}% "
+                f"if record.get('bonding_progress') else 'N/A')")
     _write_count += 1
     if _write_count % TRIM_CHECK_EVERY == 0:
         _trim_discoveries_file()
+
+
+def _calculate_bonding_progress(v_sol: float) -> float:
+    """Returns 0-100 based on PumpPortal's vSolInBondingCurve."""
+    if v_sol is None:
+        return None
+    progress = (v_sol - BONDING_START_SOL) / (BONDING_GRADUATE_SOL - BONDING_START_SOL) * 100
+    return max(0, min(100, progress))
 
 
 def _handle_message(raw_message: str):
@@ -110,27 +101,16 @@ def _handle_message(raw_message: str):
     except json.JSONDecodeError:
         return
 
-    # PumpPortal sends different message shapes for different event types.
-    # A migration event vs a new-token event isn't always distinguished by
-    # an explicit "type" field in every version of their API, so we check
-    # for the presence of characteristic fields defensively.
     mint = msg.get("mint")
     if not mint:
-        return  # not a token event (could be a subscription ack, etc.)
+        return
 
-    # CONFIRMED via real data: PumpPortal tags every event with a
-    # "txType" field. "create" = new token, "migrate" = migration. The
-    # previous heuristic (checking for a "pool" field) was wrong - pump.fun
-    # messages apparently always include some pool/platform identifier,
-    # so it misclassified every single new-token event as a migration.
     tx_type = str(msg.get("txType", "")).lower()
     if tx_type == "create":
         event_type = "new_token"
-    elif "migrat" in tx_type:  # covers "migrate" and any variant naming
+    elif "migrat" in tx_type:
         event_type = "migration"
     else:
-        # Unrecognized txType - log it distinctly so we can see what it
-        # actually is rather than guessing again.
         event_type = f"unknown_{tx_type or 'notype'}"
 
     seen = _debug_logged.get(event_type, 0)
@@ -138,17 +118,35 @@ def _handle_message(raw_message: str):
         logger.info(f"RAW MESSAGE ({event_type}, {seen + 1}/{_debug_limit}): {raw_message[:500]}")
         _debug_logged[event_type] = seen + 1
 
+    # Extract bonding curve intelligence
+    v_sol = msg.get("vSolInBondingCurve")
+    v_tokens = msg.get("vTokensInBondingCurve")
+    bonding_progress = _calculate_bonding_progress(v_sol)
+
+    initial_buy = msg.get("solAmount")
+    is_whale_launch = False
+    if initial_buy is not None and initial_buy >= WHALE_THRESHOLD_SOL:
+        is_whale_launch = True
+
+    dev_wallet = msg.get("traderPublicKey")
+
     record = {
         "type": event_type,
         "mint": mint,
         "symbol": msg.get("symbol"),
         "name": msg.get("name"),
+        "dev_wallet": dev_wallet,
+        "initial_buy_sol": initial_buy,
+        "is_whale_launch": is_whale_launch,
+        "bonding_progress": bonding_progress,
+        "v_sol_in_curve": v_sol,
+        "v_tokens_in_curve": v_tokens,
         "raw": msg,
     }
-    _log_discovery(record)  # stamps record["discovered_at"] internally
+
+    _log_discovery(record)
+
     if event_type == "new_token":
-        # Separately preserved so /analyse can still find launch price
-        # even if this record gets trimmed from the busy general feed.
         _log_launch_index(dict(record))
 
 
@@ -168,8 +166,6 @@ async def listen():
 
 
 def start_keepalive_server():
-    """Same trick as telegram_bot.py - makes Render treat this as a free
-    'web service' instead of a paid 'background worker'. Harmless locally."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import os as _os
