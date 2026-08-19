@@ -364,8 +364,7 @@ class PositionTracker:
             lines.append("")
 
         lines.append(f"_Updated: {age_str} ago_")
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     def format_whale_alert(self, activity: WhaleActivity, symbol: str, current_price: float) -> str:
         """Formats a single whale activity alert."""
@@ -373,20 +372,13 @@ class PositionTracker:
         dev_tag = " 👤DEV" if activity.is_dev else ""
 
         return (
-            f"{action_emoji} *WHALE {activity.action} — {symbol}*{dev_tag}
-"
-            f"
-"
-            f"Wallet: `{activity.wallet[:6]}...{activity.wallet[-4:]}`
-"
-            f"Amount: `{activity.amount_tokens:,.0f}` tokens
-"
-            f"Value: `${activity.amount_usd:,.0f}`
-"
-            f"Price: `${current_price:.8f}`
-"
-            f"
-"
+            f"{action_emoji} *WHALE {activity.action} — {symbol}*{dev_tag}\n"
+            f"\n"
+            f"Wallet: `{activity.wallet[:6]}...{activity.wallet[-4:]}`\n"
+            f"Amount: `{activity.amount_tokens:,.0f}` tokens\n"
+            f"Value: `${activity.amount_usd:,.0f}`\n"
+            f"Price: `${current_price:.8f}`\n"
+            f"\n"
             f"_This may affect price. Monitor closely._"
         )
 

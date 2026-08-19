@@ -249,8 +249,7 @@ class PremiumSignalEngine:
         lines.append("")
         lines.append("⚡️ *Premium Signal — High conviction, timed entry*")
 
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     def get_stats(self) -> dict:
         """Returns premium signal performance stats."""
