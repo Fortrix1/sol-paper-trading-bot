@@ -1,18 +1,18 @@
 """
-telegram_bot.py - Paper-trading + REAL trading Telegram bot with GOLDMINE detection,
+telegram_bot.py - Paper + REAL trading bot with GOLDMINE detection,
 conviction scoring, autopilot, BONDED curve sniping, bundle detection,
-smart money tracking, PREMIUM signals, and Phantom wallet integration.
+smart money tracking, PREMIUM signals, Phantom wallet integration,
+ASYNC price feeds, whale labeling, and trade estimation.
 
-NEW IN THIS VERSION:
-  - /wallet -- Link Phantom wallet (bot generates dedicated wallet)
-  - /realbuy -- Buy with REAL SOL
-  - /realsell -- Sell for REAL SOL
-  - /realpositions -- Live real P&L with whale activity
-  - /whales -- Whale buy/sell alerts for held tokens
-  - /premium -- Premium high-conviction signals
-  - Faster async price fetching
-  - Auto-refresh position updates every 20s
-  - Early-stage coin alerts (< 60s old)
+BATCH 3 ADDITIONS:
+  - async_price_feed for lightning-fast price lookups
+  - /estimate <CA> — AI-style buy/hold/sell signal with reasoning
+  - /holdings — Combined paper + real holdings with USD values
+  - /realstats — Real trading performance stats
+  - /setlabel <wallet> <category> <name> — Label known wallets
+  - /labels — Browse whale label database
+  - Enhanced /whales with labeled wallet names + sentiment
+  - Faster position refresh using async batch fetching
 """
 
 import re
@@ -34,6 +34,7 @@ from telegram.ext import (
 
 import config
 from price_feed import get_token_info, get_sol_usd_price
+from async_price_feed import get_token_info_async, get_sol_usd_price_async, batch_get_token_info
 from honeypot_check import HoneypotChecker
 from paper_wallet import PaperWallet
 from new_scanner import get_boosted_solana_tokens, get_graduating_coins, get_latest_new_tokens
@@ -47,6 +48,8 @@ from phantom_connector import phantom
 from real_trader import real_trader
 from premium_signals import premium_engine
 from position_tracker import tracker
+from whale_labeler import labeler
+from trade_estimator import estimator
 import live_listener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -372,12 +375,22 @@ def format_minimal_card(mint: str, raw_record: dict, sol_price_usd: float, safet
     return "\n".join(lines)
 
 
+# ==================== ASYNC BUILDERS (Batch 3 speed upgrade) ====================
+
 async def build_token_card(mint: str):
-    info = get_token_info(mint)
+    """Async version using fast price feed. Falls back to sync if needed."""
+    # Try async first (fast)
+    info = await get_token_info_async(mint)
+    if not info["ok"]:
+        # Fallback to sync
+        info = get_token_info(mint)
+
     if not info["ok"]:
         raw_record = get_raw_creation_record(mint)
         if raw_record:
-            sol_price = get_sol_usd_price()
+            sol_price = await get_sol_usd_price_async()
+            if sol_price <= 0:
+                sol_price = get_sol_usd_price()
             safety = check_safety(mint)
             eval_result = conviction.evaluate(mint, live_record=raw_record, safety=safety)
             card = format_minimal_card(mint, raw_record, sol_price, safety, eval_result)
@@ -396,7 +409,9 @@ async def build_token_card(mint: str):
     live_rec = get_raw_creation_record(mint)
     eval_result = conviction.evaluate(mint, live_record=live_rec, safety=safety, dev_rep=dev_rep, info=info)
 
-    sol_price = get_sol_usd_price()
+    sol_price = await get_sol_usd_price_async()
+    if sol_price <= 0:
+        sol_price = get_sol_usd_price()
     launch = get_launch_price(mint, sol_price) if sol_price > 0 else {"ok": False}
 
     card = format_token_card(mint, info, safety, dev_rep, launch, eval_result)
@@ -429,7 +444,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet.apply_daily_topup(user_id)
     balance = wallet.get_balance(user_id)
     await update.message.reply_text(
-        "👋 *Solana Goldmine Bot* -- Paper + Real Trading\n\n"
+        "👋 *Solana Goldmine Bot* -- Paper + Real Trading (Batch 3)\n\n"
         f"Fake balance: *{balance:.3f} SOL*\n"
         f"(Real wallet: `/wallet` to check)\n\n"
         "*How to use:*\n"
@@ -437,21 +452,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. The bot alerts you when it finds a *goldmine*\n"
         "3. Tap *APE IN* to paper-buy, or /autopilot for auto-buy\n"
         "4. `/realbuy <CA>` to trade with REAL SOL\n"
-        "5. Sell manually or let auto-exit handle TP/SL\n\n"
+        "5. `/estimate <CA>` for AI trade signals\n"
+        "6. Sell manually or let auto-exit handle TP/SL\n\n"
         "*Commands:*\n"
         "Send a CA -- full analysis + conviction score\n"
         "/wallet -- Link/check your real wallet\n"
-        "/realbuy <CA> -- Buy with REAL SOL\n"
+        "/holdings -- ALL your coins + amounts + USD values\n"
+        "/realbuy <CA> [SOL] -- Buy with REAL SOL\n"
         "/realsell <CA> -- Sell for REAL SOL\n"
         "/realpositions -- Live real P&L + whales\n"
+        "/realstats -- Real trading performance\n"
         "/premium -- Premium high-conviction signals\n"
-        "/whales -- Whale activity on your tokens\n"
+        "/whales -- Whale activity on your tokens (with labels!)\n"
+        "/estimate <CA> -- AI buy/hold/sell signal\n"
         "/bonded -- tokens IN bonding curve\n"
         "/graduated -- tokens that just LEFT the curve\n"
         "/autopilot -- toggle auto paper-buying ON/OFF\n"
         "/conviction <CA> -- check goldmine score\n"
         "/smartmoney -- view tracked dev wallets\n"
         "/addsmart <wallet> <tag> -- manually track a wallet\n"
+        "/setlabel <wallet> <category> <name> -- label a whale\n"
+        "/labels -- browse whale label database\n"
         "/balance -- fake SOL balance\n"
         "/positions -- open paper trades with P&L\n"
         "/activity -- trade history with charts\n"
@@ -463,7 +484,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --- NEW: WALLET COMMANDS ---
+# --- WALLET & REAL TRADING COMMANDS ---
 
 async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show Phantom-linked wallet status."""
@@ -472,6 +493,76 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🔄 Refresh Balance", callback_data="wallet_refresh"),
     ]])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Batch 3: Combined paper + real holdings with USD values."""
+    user_id = str(update.effective_user.id)
+    sol_price = await get_sol_usd_price_async()
+    if sol_price <= 0:
+        sol_price = get_sol_usd_price()
+
+    lines = ["💼 *Your Holdings*", ""]
+    total_value_usd = 0.0
+    has_any = False
+
+    # Paper positions
+    paper_positions = wallet.get_open_positions(user_id)
+    if paper_positions:
+        has_any = True
+        lines.append("*🔵 Paper Positions:*")
+        mints = list(paper_positions.keys())
+        prices = await batch_get_token_info(mints)
+        for mint, pos in paper_positions.items():
+            info = prices.get(mint, {})
+            price = info.get("price_usd", 0) if info.get("ok") else 0
+            tokens = pos.get("tokens_held", 0)
+            value_usd = tokens * price
+            entry = pos["entry_price_usd"]
+            change = ((price - entry) / entry * 100) if entry > 0 else 0
+            arrow = "🟢" if change >= 0 else "🔴"
+            lines.append(
+                f"{arrow} *{pos['symbol']}*\n"
+                f"  Tokens: `{tokens:,.2f}`\n"
+                f"  Value: `${value_usd:.2f}`\n"
+                f"  Entry: `${entry:.8f}` → Now: `${price:.8f}`\n"
+                f"  P&L: `{change:+.1f}%`"
+            )
+            total_value_usd += value_usd
+        lines.append("")
+
+    # Real positions
+    if real_trader.positions:
+        has_any = True
+        lines.append("*🔴 Real Positions:*")
+        mints = list(real_trader.positions.keys())
+        prices = await batch_get_token_info(mints)
+        for mint, pos in real_trader.positions.items():
+            info = prices.get(mint, {})
+            price = info.get("price_usd", 0) if info.get("ok") else 0
+            tokens = pos.get("tokens_held", 0)
+            value_usd = tokens * price
+            entry = pos["entry_price_usd"]
+            invested_usd = pos["sol_spent"] * sol_price
+            change = ((price - entry) / entry * 100) if entry > 0 else 0
+            pnl_usd = value_usd - invested_usd
+            arrow = "🟢" if change >= 0 else "🔴"
+            lines.append(
+                f"{arrow} *{pos['symbol']}*\n"
+                f"  Tokens: `{tokens:,.2f}`\n"
+                f"  Value: `${value_usd:.2f}`\n"
+                f"  Invested: `${invested_usd:.2f}`\n"
+                f"  P&L: `${pnl_usd:+.2f}` (`{change:+.1f}%`)"
+            )
+            total_value_usd += value_usd
+        lines.append("")
+
+    if not has_any:
+        lines.append("No open positions. Use `/realbuy <CA>` or tap *APE IN* on a token.")
+    else:
+        lines.append(f"*Total value: `${total_value_usd:.2f}`*")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,8 +674,131 @@ async def realpositions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Error updating {pos['symbol']}: {e}")
 
 
+async def realstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Batch 3: Real trading performance stats."""
+    txs = real_trader.get_recent_transactions(limit=100)
+    if not txs:
+        await update.message.reply_text("🔴 No real trades yet. Use `/realbuy <CA>` to start.")
+        return
+
+    buys = [t for t in txs if t.get("type") == "BUY"]
+    sells = [t for t in txs if t.get("type") == "SELL"]
+    total_pnl = sum(t.get("pnl_sol", 0) for t in sells)
+    wins = sum(1 for t in sells if t.get("pnl_sol", 0) > 0)
+    losses = sum(1 for t in sells if t.get("pnl_sol", 0) <= 0)
+    win_rate = (wins / len(sells) * 100) if sells else 0
+
+    # Current open P&L
+    sol_price = await get_sol_usd_price_async()
+    if sol_price <= 0:
+        sol_price = get_sol_usd_price()
+    open_pnl = 0.0
+    for mint, pos in real_trader.positions.items():
+        info = await get_token_info_async(mint)
+        if info.get("ok"):
+            current = info["price_usd"]
+            entry = pos["entry_price_usd"]
+            tokens = pos["tokens_held"]
+            invested = pos["sol_spent"] * sol_price
+            value = tokens * current
+            open_pnl += (value - invested)
+
+    lines = [
+        "🔴 *Real Trading Stats*",
+        "",
+        f"Total trades: `{len(buys)}` buys, `{len(sells)}` sells",
+        f"Win rate: `{win_rate:.1f}%` ({wins}W / {losses}L)",
+        f"Realized P&L: `{total_pnl:+.4f} SOL`",
+        f"Open unrealized: `${open_pnl:+.2f}`",
+        "",
+        f"Open positions: `{len(real_trader.positions)}`",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# --- BATCH 3: NEW COMMANDS ---
+
+async def estimate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI-style trade estimator: buy/hold/sell with reasoning."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/estimate <token_address>`\n"
+            "Get an AI-style signal with confidence, risk level, and reasoning.",
+            parse_mode="Markdown",
+        )
+        return
+
+    mint = context.args[0]
+    if not MINT_PATTERN.match(mint):
+        await update.message.reply_text("Invalid Solana address.")
+        return
+
+    await update.message.reply_text(f"🧠 Analyzing `{mint}`...", parse_mode="Markdown")
+
+    try:
+        safety = check_safety(mint)
+        dev_rep = None
+        if safety.get("creator"):
+            dev_rep = get_deployer_reputation(safety["creator"], config.HELIUS_API_KEY)
+        live_rec = get_raw_creation_record(mint)
+
+        signal = await estimator.estimate(mint, live_record=live_rec, safety=safety, dev_rep=dev_rep)
+        text = estimator.format_signal(signal)
+
+        buttons = []
+        if signal.verdict in ("STRONG_BUY", "BUY"):
+            buttons.append(InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{mint}:{signal.symbol}"))
+            buttons.append(InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{mint}:{signal.symbol}"))
+        elif signal.verdict in ("SELL", "STRONG_SELL"):
+            buttons.append(InlineKeyboardButton("🔴 SELL REAL", callback_data=f"realsell:{mint}"))
+        keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Estimate failed: {e}")
+        await update.message.reply_text(f"Analysis failed: {e}")
+
+
+async def setlabel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually label a wallet for whale tracking."""
+    if len(context.args) < 3:
+        cats = ", ".join(labeler.CATEGORIES.keys())
+        await update.message.reply_text(
+            f"Usage: `/setlabel <wallet> <category> <name>`\n"
+            f"Categories: `{cats}`\n"
+            f"Example: `/setlabel ABC123... known_dev MoonshotDev`",
+            parse_mode="Markdown",
+        )
+        return
+
+    wallet_addr = context.args[0]
+    category = context.args[1]
+    name = " ".join(context.args[2:])
+
+    if category not in labeler.CATEGORIES:
+        cats = ", ".join(labeler.CATEGORIES.keys())
+        await update.message.reply_text(f"Invalid category. Use one of: `{cats}`", parse_mode="Markdown")
+        return
+
+    labeler.add_label(wallet_addr, name, category, source="user")
+    emoji = labeler.CATEGORIES.get(category, "👤")
+    await update.message.reply_text(
+        f"✅ Labeled `{wallet_addr[:10]}...`\n"
+        f"{emoji} *{name}* (`{category}`)",
+        parse_mode="Markdown",
+    )
+
+
+async def labels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Browse the whale label database."""
+    text = labeler.get_summary_text()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# --- ENHANCED WHALES COMMAND (Batch 3) ---
+
 async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show whale activity for all held tokens."""
+    """Show whale activity for all held tokens WITH labels and estimates."""
     user_id = str(update.effective_user.id)
     paper_positions = wallet.get_open_positions(user_id)
     all_positions = {**paper_positions}
@@ -594,11 +808,13 @@ async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No open positions to track whales.")
         return
 
-    await update.message.reply_text("🐋 Scanning whale activity...")
+    await update.message.reply_text("🐋 Scanning whale activity with labels...")
 
     for mint, pos in all_positions.items():
         try:
-            info = get_token_info(mint)
+            info = await get_token_info_async(mint)
+            if not info.get("ok"):
+                info = get_token_info(mint)
             if not info.get("ok"):
                 continue
             current_price = info["price_usd"]
@@ -606,27 +822,44 @@ async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             transfers = await tracker.fetch_token_transfers(mint, limit=30)
             activities = tracker.detect_whale_activity(mint, transfers, current_price)
 
+            # Auto-label any new whales
+            for act in activities:
+                labeler.auto_label_whale(act.wallet, act.amount_usd)
+
             if activities:
                 sentiment = tracker.analyze_whale_sentiment(activities)
                 lines = [
-                    f"🐋 *Whale Activity -- {pos['symbol']}*",
-                    f"",
+                    f"🐋 *Whale Activity — {pos['symbol']}*",
+                    "",
                     f"{sentiment['emoji']} *{sentiment['sentiment']}*",
                     f"Net flow: `${sentiment['net_flow_usd']:+.0f}`",
                     f"Buys: {sentiment['count_buy']} (${sentiment['total_buy_usd']:,.0f})",
                     f"Sells: {sentiment['count_sell']} (${sentiment['total_sell_usd']:,.0f})",
-                    f"",
+                    "",
                 ]
-                for w in activities[:5]:
+                for i, w in enumerate(activities[:5], 1):
                     action_emoji = "🟢" if w.action == "BUY" else "🔴"
-                    short = f"{w.wallet[:6]}...{w.wallet[-4:]}"
-                    lines.append(f"{action_emoji} `{short}` -- `${w.amount_usd:,.0f}`")
+                    display = labeler.get_display_name(w.wallet)
+                    lines.append(f"{i}. {action_emoji} {display} — `{w.amount_tokens:,.0f}` tokens (`${w.amount_usd:,.0f}`)")
+
+                # Add estimate
+                try:
+                    safety = check_safety(mint)
+                    signal = await estimator.estimate(mint, safety=safety)
+                    e_emoji = {"STRONG_BUY": "🚀", "BUY": "🟢", "HOLD": "🟡", "SELL": "🔴", "STRONG_SELL": "🛑", "AVOID": "🚫"}
+                    lines.append("")
+                    lines.append(f"*Bot Estimate:* {e_emoji.get(signal.verdict, '❓')} `{signal.verdict}` ({signal.confidence}% confidence)")
+                except Exception:
+                    pass
+
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"🐋 {pos['symbol']}: No whale activity in last 30 txs.")
         except Exception as e:
             logger.warning(f"Whale scan failed for {mint}: {e}")
 
+
+# --- PREMIUM COMMANDS ---
 
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show premium high-conviction signals."""
@@ -675,7 +908,7 @@ async def premium_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --- EXISTING COMMANDS (kept from original) ---
+# --- EXISTING COMMANDS (preserved from Batch 1/2) ---
 
 async def bonded_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live = read_live_discoveries("new_token", max_age_seconds=1800)
@@ -1091,9 +1324,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("buy:"):
         _, mint, symbol = data.split(":", 2)
-        info = get_token_info(mint)
-        sol_price = get_sol_usd_price()
-        if not info["ok"] or sol_price <= 0:
+        info = await get_token_info_async(mint)
+        if not info.get("ok"):
+            info = get_token_info(mint)
+        sol_price = await get_sol_usd_price_async()
+        if sol_price <= 0:
+            sol_price = get_sol_usd_price()
+        if not info.get("ok") or sol_price <= 0:
             await query.message.reply_text("Price data unavailable, try again shortly.")
             return
         result = wallet.buy(
@@ -1133,9 +1370,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("sell:"):
         _, mint = data.split(":", 1)
-        info = get_token_info(mint)
-        sol_price = get_sol_usd_price()
-        if not info["ok"] or sol_price <= 0:
+        info = await get_token_info_async(mint)
+        if not info.get("ok"):
+            info = get_token_info(mint)
+        sol_price = await get_sol_usd_price_async()
+        if sol_price <= 0:
+            sol_price = get_sol_usd_price()
+        if not info.get("ok") or sol_price <= 0:
             await query.message.reply_text("Price data unavailable, try again shortly.")
             return
         result = wallet.sell(user_id, mint, info["price_usd"], sol_price)
@@ -1175,9 +1416,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
     """Push live position updates with full details including whales."""
-    sol_price = get_sol_usd_price()
+    sol_price = await get_sol_usd_price_async()
+    if sol_price <= 0:
+        sol_price = get_sol_usd_price()
     if sol_price <= 0:
         return
+
+    # Batch fetch all prices for speed
+    all_mints = set()
+    for user_data in wallet.users.values():
+        all_mints.update(user_data.get("open_positions", {}).keys())
+    all_mints.update(real_trader.positions.keys())
+
+    if all_mints:
+        await batch_get_token_info(list(all_mints))
 
     # Paper positions
     for user_id, user_data in wallet.users.items():
@@ -1194,8 +1446,10 @@ async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
                         chat_id=int(user_id), text=text, parse_mode="Markdown", reply_markup=keyboard
                     )
                 else:
-                    info = get_token_info(mint)
-                    if info["ok"]:
+                    info = await get_token_info_async(mint)
+                    if not info.get("ok"):
+                        info = get_token_info(mint)
+                    if info.get("ok"):
                         wallet.record_price_snapshot(user_id, mint, info["price_usd"])
                         text = format_position_update(mint, pos, info["price_usd"])
                         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Sell Paper", callback_data=f"sell:{mint}")]])
@@ -1225,7 +1479,9 @@ async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
     """Auto TP/SL for both paper and real positions."""
-    sol_price = get_sol_usd_price()
+    sol_price = await get_sol_usd_price_async()
+    if sol_price <= 0:
+        sol_price = get_sol_usd_price()
     if sol_price <= 0:
         return
 
@@ -1235,8 +1491,10 @@ async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
         if not positions:
             continue
         for mint, pos in list(positions.items()):
-            info = get_token_info(mint)
-            if not info["ok"]:
+            info = await get_token_info_async(mint)
+            if not info.get("ok"):
+                info = get_token_info(mint)
+            if not info.get("ok"):
                 continue
             entry = pos["entry_price_usd"]
             current = info["price_usd"]
@@ -1272,8 +1530,10 @@ async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
 
     # Real auto-exit
     for mint, pos in list(real_trader.positions.items()):
-        info = get_token_info(mint)
-        if not info["ok"]:
+        info = await get_token_info_async(mint)
+        if not info.get("ok"):
+            info = get_token_info(mint)
+        if not info.get("ok"):
             continue
         exit_type = real_trader.check_auto_exit(mint, info["price_usd"])
         if exit_type:
@@ -1420,6 +1680,14 @@ async def daily_topup_job(context: ContextTypes.DEFAULT_TYPE):
         wallet.apply_daily_topup(user_id)
 
 
+async def sync_smart_money_labels(context: ContextTypes.DEFAULT_TYPE):
+    """Batch 3: Periodically sync smart money tracker with whale labeler."""
+    try:
+        labeler.auto_label_from_smart_money(smart_money.wallets)
+    except Exception as e:
+        logger.warning(f"Smart money label sync failed: {e}")
+
+
 def start_keepalive_server():
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1449,12 +1717,17 @@ def main():
     # Core commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wallet", wallet_cmd))
+    app.add_handler(CommandHandler("holdings", holdings_cmd))
     app.add_handler(CommandHandler("realbuy", realbuy_cmd))
     app.add_handler(CommandHandler("realsell", realsell_cmd))
     app.add_handler(CommandHandler("realpositions", realpositions_cmd))
-    app.add_handler(CommandHandler("whales", whales_cmd))
+    app.add_handler(CommandHandler("realstats", realstats_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("premiumstats", premium_stats_cmd))
+    app.add_handler(CommandHandler("whales", whales_cmd))
+    app.add_handler(CommandHandler("estimate", estimate_cmd))
+    app.add_handler(CommandHandler("setlabel", setlabel_cmd))
+    app.add_handler(CommandHandler("labels", labels_cmd))
 
     # Existing commands
     app.add_handler(CommandHandler("bonded", bonded_cmd))
@@ -1484,8 +1757,9 @@ def main():
     job_queue.run_repeating(premium_scanner, interval=45, first=20)
     job_queue.run_repeating(early_stage_alerts, interval=30, first=10)
     job_queue.run_repeating(daily_topup_job, interval=3600, first=10)
+    job_queue.run_repeating(sync_smart_money_labels, interval=300, first=60)
 
-    logger.info("Goldmine bot starting with REAL trading support...")
+    logger.info("Goldmine bot Batch 3 starting with ASYNC feeds + whale labels + trade estimator...")
     app.run_polling()
 
 

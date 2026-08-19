@@ -1,5 +1,6 @@
 python-telegram-bot[job-queue]>=21.0
 requests
+aiohttp
 matplotlib
 base58
 websockets
