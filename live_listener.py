@@ -76,12 +76,24 @@ def _log_launch_index(record: dict):
 def _log_discovery(record: dict):
     global _write_count
     record["discovered_at"] = time.time()
+
+    # FIX: Safely format bonding_progress to avoid None:.0f crash
+    bp = record.get("bonding_progress")
+    if isinstance(bp, (int, float)):
+        bp_str = f"{bp:.0f}%"
+    else:
+        bp_str = "N/A"
+
+    score = record.get("conviction_score", "N/A")
+
+    logger.info(
+        f"DISCOVERY: {record.get('type')} - mint={record.get('mint')} "
+        f"score={score} bonding={bp_str}"
+    )
+
     with open(DISCOVERIES_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
-    logger.info(f"DISCOVERY: {record.get('type')} - mint={record.get('mint')} "
-                f"score={record.get('conviction_score', 'N/A')} "
-                f"bonding={record.get('bonding_progress', 'N/A'):.0f}% "
-                f"if record.get('bonding_progress') else 'N/A')")
+
     _write_count += 1
     if _write_count % TRIM_CHECK_EVERY == 0:
         _trim_discoveries_file()
@@ -159,7 +171,11 @@ async def listen():
                 await ws.send(json.dumps({"method": "subscribeMigration"}))
                 logger.info("Subscribed to new tokens + migrations. Listening...")
                 async for message in ws:
-                    _handle_message(message)
+                    try:
+                        _handle_message(message)
+                    except Exception as inner_e:
+                        # FIX: Catch errors inside message handler so they don't kill the connection
+                        logger.warning(f"Message handler error: {inner_e}")
         except Exception as e:
             logger.warning(f"Connection lost ({e}), reconnecting in 5s...")
             await asyncio.sleep(5)
