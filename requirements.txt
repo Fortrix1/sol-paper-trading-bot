@@ -3,3 +3,4 @@ requests
 matplotlib
 base58
 websockets
+solders>=0.21.0
