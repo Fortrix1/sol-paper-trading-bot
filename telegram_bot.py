@@ -1753,7 +1753,7 @@ def main():
     job_queue = app.job_queue
     job_queue.run_repeating(push_position_updates, interval=config.POSITION_AUTO_REFRESH_SECONDS, first=30)
     job_queue.run_repeating(auto_exit_checker, interval=60, first=60)
-    job_queue.run_repeating(goldmine_scanner, interval=30, first=15)
+    job_queue.run_repeating(goldmine_scanner, interval=60, first=15)
     job_queue.run_repeating(premium_scanner, interval=45, first=20)
     job_queue.run_repeating(early_stage_alerts, interval=30, first=10)
     job_queue.run_repeating(daily_topup_job, interval=3600, first=10)
