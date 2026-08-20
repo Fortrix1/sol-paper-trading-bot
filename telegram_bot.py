@@ -1,10 +1,10 @@
 """
-telegram_bot.py - FIXED VERSION
-- All blocking I/O wrapped in asyncio.to_thread()
-- Non-overlapping background job intervals
-- NEW: Pump alerts when your held coins are doing well
-- NEW: Market mover alerts for discovered tokens
-- Better error resilience so alerts actually fire
+telegram_bot.py - FIXED VERSION v2
+- Dual buttons (Paper + Real) on EVERY token card
+- Fast /premium (no hanging)
+- /holdings shows real wallet tokens + paper positions
+- Buy/sell counts on all cards
+- Non-overlapping background jobs
 """
 
 import re
@@ -40,7 +40,7 @@ from risk_manager import RiskManager
 from smart_money_tracker import SmartMoneyTracker
 from phantom_connector import phantom
 from real_trader import real_trader
-from premium_signals import premium_engine
+from premium_signals import premium_engine, PremiumSignal
 from position_tracker import tracker
 from whale_labeler import labeler
 from trade_estimator import estimator
@@ -66,11 +66,9 @@ RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{}/report"
 MINT_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 MINT_SEARCH_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
 
-# Track last pump alert per mint per user to avoid spam
-_pump_alert_tracker = {}  # (user_id, mint) -> {"price": float, "time": float}
+_pump_alert_tracker = {}
 
-
-# ==================== ASYNC WRAPPERS FOR BLOCKING CALLS ====================
+# ==================== ASYNC WRAPPERS ====================
 
 async def _check_safety(mint: str) -> dict:
     checker = HoneypotChecker(
@@ -186,6 +184,8 @@ async def _get_launch_price(mint: str, sol_price_usd: float) -> dict:
     return await asyncio.to_thread(_get_launch_price_sync, mint, sol_price_usd)
 
 
+# ==================== HELPERS ====================
+
 def format_age(age_minutes):
     if age_minutes is None:
         return "unknown"
@@ -198,6 +198,14 @@ def format_age(age_minutes):
     days = hours // 24
     hours = hours % 24
     return f"{days}d {hours}h"
+
+
+def make_trade_buttons(mint: str, symbol: str) -> list:
+    """Returns a row with both Paper and Real buy buttons."""
+    return [
+        InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{mint}:{symbol}"),
+        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{mint}:{symbol}"),
+    ]
 
 
 def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
@@ -255,10 +263,17 @@ def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
         f"MCap: `${info.get('mcap_usd', 0):,.0f}`" + (f" · FDV: `${info.get('fdv_usd', 0):,.0f}`" if info.get("fdv_usd") else ""),
         f"Age: `{age}` · Boosted: `{'Yes' if info.get('is_boosted') else 'No'}`",
         "",
-        "*-- Contract --*",
-        contract_line,
-        activity_line,
     ]
+
+    # Buy/sell counts
+    buys = info.get("buys_h1", 0)
+    sells = info.get("sells_h1", 0)
+    net = buys - sells
+    net_emoji = "🟢" if net > 0 else "🔴" if net < 0 else "⚪"
+    lines.append(f"📊 *Activity (1h):* Buys: `{buys}` | Sells: `{sells}` {net_emoji} Net: `{net:+d}`")
+    lines.append("")
+
+    lines += ["*-- Contract --*", contract_line, activity_line]
 
     if check_failed:
         lines.append("Renounced: ⚫ Unknown")
@@ -392,11 +407,9 @@ def format_minimal_card(mint: str, raw_record: dict, sol_price_usd: float, safet
     lines.append("_This is a PAPER trade - no real funds involved._")
     return "\n".join(lines)
 
-
 # ==================== ASYNC BUILDERS ====================
 
 async def build_token_card(mint: str):
-    """Async version using fast price feed. Falls back to sync if needed."""
     info = await get_token_info_async(mint)
     if not info["ok"]:
         info = await _get_token_info_sync(mint)
@@ -410,10 +423,8 @@ async def build_token_card(mint: str):
             safety = await _check_safety(mint)
             eval_result = await asyncio.to_thread(conviction.evaluate, mint, live_record=raw_record, safety=safety)
             card = format_minimal_card(mint, raw_record, sol_price, safety, eval_result)
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{raw_record.get('symbol', '?')}"),
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
-            ]])
+            symbol = raw_record.get("symbol", "?")
+            keyboard = InlineKeyboardMarkup([make_trade_buttons(mint, symbol)])
             return card, keyboard, None
         return None, None, info.get("error", "unknown error")
 
@@ -434,11 +445,7 @@ async def build_token_card(mint: str):
 
     card = format_token_card(mint, info, safety, dev_rep, launch, eval_result)
 
-    buttons = []
-    if eval_result["score"] >= config.GOLDMINE_ALERT_THRESHOLD:
-        buttons.append(InlineKeyboardButton(f"🚀 APE IN ({config.DEFAULT_BUY_SIZE_SOL} SOL)", callback_data=f"buy:{mint}:{info['symbol']}"))
-    else:
-        buttons.append(InlineKeyboardButton(f"Buy {config.DEFAULT_BUY_SIZE_SOL} SOL", callback_data=f"buy:{mint}:{info['symbol']}"))
+    buttons = make_trade_buttons(mint, info.get("symbol", "?"))
     buttons.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"))
 
     keyboard_rows = [buttons]
@@ -462,20 +469,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(wallet.apply_daily_topup, user_id)
     balance = await asyncio.to_thread(wallet.get_balance, user_id)
     await update.message.reply_text(
-        "👋 *Solana Goldmine Bot* -- Paper + Real Trading (FIXED)\n\n"
+        "👋 *Solana Goldmine Bot* -- Paper + Real Trading\n\n"
         f"Fake balance: *{balance:.3f} SOL*\n"
         f"(Real wallet: `/wallet` to check)\n\n"
         "*How to use:*\n"
         "1. Run `python live_listener.py` in another terminal\n"
         "2. The bot alerts you when it finds a *goldmine* or when your coins *pump*\n"
-        "3. Tap *APE IN* to paper-buy, or /autopilot for auto-buy\n"
+        "3. Tap *APE IN (Paper)* for fake SOL, or *REAL BUY* for real SOL\n"
         "4. `/realbuy <CA>` to trade with REAL SOL\n"
         "5. `/estimate <CA>` for AI trade signals\n"
         "6. Sell manually or let auto-exit handle TP/SL\n\n"
         "*Commands:*\n"
         "Send a CA -- full analysis + conviction score\n"
         "/wallet -- Link/check your real wallet\n"
-        "/holdings -- ALL your coins + amounts + USD values\n"
+        "/holdings -- ALL your coins (paper + real wallet)\n"
         "/realbuy <CA> [SOL] -- Buy with REAL SOL\n"
         "/realsell <CA> -- Sell for REAL SOL\n"
         "/realpositions -- Live real P&L + whales\n"
@@ -510,13 +517,7 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
-
-
 async def connectphantom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Connect your Phantom wallet by importing its private key.
-    Usage: /connectphantom <base58_private_key>
-    """
     if not context.args:
         await update.message.reply_text(
             "🔑 *Connect Your Phantom Wallet*\n\n"
@@ -570,7 +571,6 @@ async def connectphantom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def disconnectphantom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset to a fresh bot-generated wallet."""
     import os as _os
     if _os.path.exists(config.REAL_WALLET_FILE):
         _os.remove(config.REAL_WALLET_FILE)
@@ -594,6 +594,7 @@ async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_value_usd = 0.0
     has_any = False
 
+    # Paper positions
     paper_positions = await asyncio.to_thread(wallet.get_open_positions, user_id)
     if paper_positions:
         has_any = True
@@ -618,9 +619,10 @@ async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_value_usd += value_usd
         lines.append("")
 
+    # Real trading positions (open trades)
     if real_trader.positions:
         has_any = True
-        lines.append("*🔴 Real Positions:*")
+        lines.append("*🔴 Real Trading Positions:*")
         mints = list(real_trader.positions.keys())
         prices = await batch_get_token_info(mints)
         for mint, pos in real_trader.positions.items():
@@ -643,8 +645,31 @@ async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_value_usd += value_usd
         lines.append("")
 
+    # Real wallet holdings (ALL tokens in wallet, not just tracked trades)
+    real_holdings = phantom.get_holdings()
+    if real_holdings:
+        has_any = True
+        lines.append("*👛 Real Wallet Holdings:*")
+        mints = list(real_holdings.keys())
+        prices = await batch_get_token_info(mints)
+        for mint, data in real_holdings.items():
+            info = prices.get(mint, {})
+            price = info.get("price_usd", 0) if info.get("ok") else 0
+            ui_amount = data.get("ui_amount", 0)
+            value_usd = ui_amount * price
+            symbol = info.get("symbol", data.get("symbol", "UNKNOWN")) if info.get("ok") else data.get("symbol", "UNKNOWN")
+            lines.append(
+                f"• *{symbol}*\n"
+                f"  Tokens: `{ui_amount:,.4f}`\n"
+                f"  Value: `${value_usd:.2f}`\n"
+                f"  `{mint[:8]}...{mint[-4:]}`"
+            )
+            total_value_usd += value_usd
+        lines.append("")
+
     if not has_any:
-        lines.append("No open positions. Use `/realbuy <CA>` or tap *APE IN* on a token.")
+        lines.append("No open positions or wallet holdings.\n")
+        lines.append("Use `/realbuy <CA>` or tap *APE IN (Paper)* on a token.")
     else:
         lines.append(f"*Total value: `${total_value_usd:.2f}`*")
 
@@ -825,10 +850,9 @@ async def estimate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
         if signal.verdict in ("STRONG_BUY", "BUY"):
-            buttons.append(InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{mint}:{signal.symbol}"))
-            buttons.append(InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{mint}:{signal.symbol}"))
+            buttons = make_trade_buttons(mint, signal.symbol)
         elif signal.verdict in ("SELL", "STRONG_SELL"):
-            buttons.append(InlineKeyboardButton("🔴 SELL REAL", callback_data=f"realsell:{mint}"))
+            buttons = [InlineKeyboardButton("🔴 SELL REAL", callback_data=f"realsell:{mint}")]
         keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
 
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -931,14 +955,27 @@ async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚡️ Scanning for premium signals...")
+    """Fast premium command - shows cached signals, doesn't scan."""
+    signals = []
+    if os.path.exists(config.PREMIUM_STATE_FILE):
+        try:
+            with open(config.PREMIUM_STATE_FILE) as f:
+                data = json.load(f)
+            for mint, sig_dict in data.get("signals", {}).items():
+                if time.time() - sig_dict.get("timestamp", 0) < 1800:
+                    signals.append(PremiumSignal(**sig_dict))
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    signals = await _scan_premium(300)
+    signals.sort(key=lambda s: s.score, reverse=True)
+    signals = [s for s in signals if s.outcome == "PENDING"]
+
     if not signals:
         stats = await asyncio.to_thread(premium_engine.get_stats)
         await update.message.reply_text(
-            f"⚡️ *No premium signals right now.*\n"
+            f"⚡️ *No active premium signals right now.*\n"
             f"\n"
+            f"_The bot scans every 60s in the background and alerts you instantly._\n"
             f"_Premium filters: Score ≥{config.PREMIUM_SIGNAL_THRESHOLD}, Liq ≥${config.PREMIUM_MIN_LIQUIDITY_USD:,.0f}, Age <{config.PREMIUM_MAX_AGE_MINUTES}m_\n"
             f"\n"
             f"📊 *Premium Stats*\n"
@@ -949,14 +986,11 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(f"⚡️ *{len(signals)} PREMIUM SIGNAL(S) FOUND*", parse_mode="Markdown")
+    await update.message.reply_text(f"⚡️ *{len(signals)} ACTIVE PREMIUM SIGNAL(S)*", parse_mode="Markdown")
 
     for signal in signals[:5]:
         text = await asyncio.to_thread(premium_engine.format_premium_alert, signal)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{signal.mint}:{signal.symbol}"),
-            InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{signal.mint}:{signal.symbol}"),
-        ]])
+        keyboard = InlineKeyboardMarkup([make_trade_buttons(signal.mint, signal.symbol)])
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -1027,10 +1061,9 @@ async def bonded_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("")
                 lines.append("_Too new for full analysis -- tap Refresh in a minute._")
 
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{symbol}"),
-                    InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"),
-                ]])
+                btns = make_trade_buttons(mint, symbol)
+                btns.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"cardrefresh:{mint}"))
+                keyboard = InlineKeyboardMarkup([btns])
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
                 continue
 
@@ -1079,19 +1112,24 @@ async def graduated_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ago = format_age(mig["seconds_ago"] // 60) if mig.get("seconds_ago") and mig["seconds_ago"] >= 60 else f"{mig.get('seconds_ago', '?')}s"
         lines = [f"🎓 *Graduated {ago} ago*"]
         if mig.get("mint") and mig.get("mint_confirmed"):
-            lines.append(f"Mint: `{mig['mint']}`")
-            safety = await _check_safety(mig["mint"])
+            mint = mig["mint"]
+            lines.append(f"Mint: `{mint}`")
+            safety = await _check_safety(mint)
             if safety.get("mint_authority"):
                 lines.append("⚠️ Mint authority active")
             if safety.get("freeze_authority"):
                 lines.append("⚠️ Freeze authority active")
             if not safety.get("mint_authority") and not safety.get("freeze_authority"):
                 lines.append("✅ No mint/freeze red flags")
+            btns = make_trade_buttons(mint, "?")
+            keyboard = InlineKeyboardMarkup([btns])
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
         elif mig.get("mint"):
             lines.append(f"Mint: `{mig['mint']}` ⚠️ unconfirmed")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
             lines.append("Mint: unknown")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def smartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1365,7 +1403,6 @@ async def handle_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(card, parse_mode="Markdown", reply_markup=keyboard)
 
-
 # ==================== CALLBACK HANDLERS ====================
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1483,10 +1520,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ==================== BACKGROUND JOBS (FIXED) ====================
+# ==================== BACKGROUND JOBS ====================
 
 async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
-    """Push live position updates every 60s."""
     sol_price = await get_sol_usd_price_async()
     if sol_price <= 0:
         sol_price = await _get_sol_price_sync()
@@ -1547,7 +1583,6 @@ async def push_position_updates(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
-    """Auto TP/SL for both paper and real positions."""
     sol_price = await get_sol_usd_price_async()
     if sol_price <= 0:
         sol_price = await _get_sol_price_sync()
@@ -1629,7 +1664,6 @@ async def auto_exit_checker(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def goldmine_scanner(context: ContextTypes.DEFAULT_TYPE):
-    """Scan for goldmines and alert users."""
     try:
         goldmines = await _scan_goldmines(200)
         if not goldmines:
@@ -1658,12 +1692,15 @@ async def goldmine_scanner(context: ContextTypes.DEFAULT_TYPE):
                     info = eval_result.get("info", {})
                     if info and info.get("ok"):
                         alert_lines.append(f"💰 Price: `${info['price_usd']:.8f}` | Liq: `${info['liquidity_usd']:,.0f}`")
+                        buys = info.get("buys_h1", 0)
+                        sells = info.get("sells_h1", 0)
+                        net = buys - sells
+                        net_emoji = "🟢" if net > 0 else "🔴" if net < 0 else "⚪"
+                        alert_lines.append(f"📊 Activity (1h): Buys: `{buys}` | Sells: `{sells}` {net_emoji} Net: `{net:+d}`")
                     alert_lines.append("")
-                    alert_lines.append("_Paper trading only. Tap APE IN to buy with fake SOL._")
+                    alert_lines.append("_Paper trading only. Tap APE IN (Paper) or REAL BUY._")
                     symbol = info.get("symbol", "?") if info else "?"
-                    keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{symbol}")
-                    ]])
+                    keyboard = InlineKeyboardMarkup([make_trade_buttons(mint, symbol)])
                     await context.bot.send_message(
                         chat_id=int(user_id),
                         text="\n".join(alert_lines),
@@ -1687,7 +1724,6 @@ async def goldmine_scanner(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def premium_scanner(context: ContextTypes.DEFAULT_TYPE):
-    """Background job to scan for premium signals and alert users."""
     try:
         signals = await _scan_premium(300)
         if not signals:
@@ -1697,10 +1733,7 @@ async def premium_scanner(context: ContextTypes.DEFAULT_TYPE):
             for user_id in list(users_copy.keys()):
                 try:
                     text = await asyncio.to_thread(premium_engine.format_premium_alert, signal)
-                    keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{signal.mint}:{signal.symbol}"),
-                        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{signal.mint}:{signal.symbol}"),
-                    ]])
+                    keyboard = InlineKeyboardMarkup([make_trade_buttons(signal.mint, signal.symbol)])
                     await context.bot.send_message(
                         chat_id=int(user_id),
                         text=text,
@@ -1714,7 +1747,6 @@ async def premium_scanner(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def early_stage_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Alert on brand new coins (< 60s old) with conviction score."""
     try:
         live = await _read_live_discoveries("new_token", config.EARLY_STAGE_ALERT_SECONDS)
         if not live:
@@ -1744,10 +1776,7 @@ async def early_stage_alerts(context: ContextTypes.DEFAULT_TYPE):
                                 lines.append(f"💰 Initial buy: `{eval_result['initial_buy_sol']:.2f} SOL`")
                             lines.append("")
                             lines.append("_Just launched! High risk, high reward._")
-                            keyboard = InlineKeyboardMarkup([[
-                                InlineKeyboardButton("🚀 APE IN", callback_data=f"buy:{mint}:{rec.get('symbol', '?')}"),
-                                InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{mint}:{rec.get('symbol', '?')}"),
-                            ]])
+                            keyboard = InlineKeyboardMarkup([make_trade_buttons(mint, rec.get("symbol", "?"))])
                             await context.bot.send_message(
                                 chat_id=int(user_id),
                                 text="\n".join(lines),
@@ -1763,10 +1792,6 @@ async def early_stage_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pump_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """
-    NEW: Alerts when YOUR held coins are doing well (pumping).
-    Checks all open positions and sends alerts for significant moves.
-    """
     try:
         sol_price = await get_sol_usd_price_async()
         if sol_price <= 0:
@@ -1801,16 +1826,10 @@ async def pump_alerts(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 change_pct = ((current_price - entry) / entry) * 100
 
-                # Alert thresholds for "doing well"
                 alert_key = (user_id, mint)
                 last_alert = _pump_alert_tracker.get(alert_key, {})
-                last_price = last_alert.get("price", entry)
                 last_time = last_alert.get("time", 0)
 
-                # Only alert if:
-                # 1. Up > 25% from entry AND not alerted in last 10 min
-                # 2. Up > 50% from entry AND not alerted in last 20 min
-                # 3. Up > 100% from entry AND not alerted in last 30 min
                 should_alert = False
                 alert_tier = 0
 
@@ -1904,7 +1923,6 @@ def main():
     app.add_handler(CommandHandler("connectphantom", connectphantom_cmd))
     app.add_handler(CommandHandler("disconnectphantom", disconnectphantom_cmd))
 
-
     # Existing commands
     app.add_handler(CommandHandler("bonded", bonded_cmd))
     app.add_handler(CommandHandler("graduated", graduated_cmd))
@@ -1932,11 +1950,11 @@ def main():
     job_queue.run_repeating(goldmine_scanner, interval=60, first=15)
     job_queue.run_repeating(premium_scanner, interval=60, first=25)
     job_queue.run_repeating(early_stage_alerts, interval=60, first=10)
-    job_queue.run_repeating(pump_alerts, interval=45, first=5)        # NEW
+    job_queue.run_repeating(pump_alerts, interval=45, first=5)
     job_queue.run_repeating(daily_topup_job, interval=3600, first=10)
     job_queue.run_repeating(sync_smart_money_labels, interval=300, first=60)
 
-    logger.info("Goldmine bot FIXED starting with ASYNC feeds + pump alerts + non-blocking jobs...")
+    logger.info("Goldmine bot FIXED v2 starting with dual buttons + fast premium + real holdings...")
     app.run_polling()
 
 
