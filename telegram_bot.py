@@ -510,6 +510,80 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
+
+
+async def connectphantom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Connect your Phantom wallet by importing its private key.
+    Usage: /connectphantom <base58_private_key>
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 *Connect Your Phantom Wallet*\n\n"
+            "This lets the bot trade using SOL from your Phantom wallet.\n\n"
+            "*How to get your private key:*\n"
+            "1. Open Phantom → Settings → Security & Privacy\n"
+            "2. Click 'Export Private Key'\n"
+            "3. Copy the base58 string\n\n"
+            "*Then run:*\n"
+            "`/connectphantom YOUR_PRIVATE_KEY`\n\n"
+            "⚠️ *SAFETY:* Only use a fresh wallet with small amounts. "
+            "Never your main Phantom with everything in it.",
+            parse_mode="Markdown",
+        )
+        return
+
+    private_key = context.args[0]
+    if len(private_key) < 40:
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid private key.\n"
+            "Phantom private keys are long base58 strings (usually 85+ chars).",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(
+        "🔐 Importing your Phantom wallet...\n"
+        "_Checking balance and verifying..._",
+        parse_mode="Markdown",
+    )
+
+    try:
+        result = phantom.import_from_phantom(private_key)
+        if result["ok"]:
+            await update.message.reply_text(
+                f"✅ *Phantom Wallet Connected!*\n\n"
+                f"Address: `{result['address']}`\n"
+                f"Balance: `{result['balance_sol']:.4f} SOL`\n\n"
+                f"You're ready to trade with `/realbuy <CA>`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *Import failed*\n{result['error']}\n\n"
+                f"Make sure you copied the full private key from Phantom.",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"Phantom connect failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def disconnectphantom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset to a fresh bot-generated wallet."""
+    import os as _os
+    if _os.path.exists(config.REAL_WALLET_FILE):
+        _os.remove(config.REAL_WALLET_FILE)
+    phantom.__init__()
+    await update.message.reply_text(
+        "🗑️ *Wallet disconnected.*\n\n"
+        "A fresh bot wallet has been generated.\n"
+        f"New address: `{phantom.public_key}`\n\n"
+        "Use `/connectphantom <key>` to link Phantom again.",
+        parse_mode="Markdown",
+    )
+
+
 async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     sol_price = await get_sol_usd_price_async()
@@ -1827,6 +1901,9 @@ def main():
     app.add_handler(CommandHandler("estimate", estimate_cmd))
     app.add_handler(CommandHandler("setlabel", setlabel_cmd))
     app.add_handler(CommandHandler("labels", labels_cmd))
+    app.add_handler(CommandHandler("connectphantom", connectphantom_cmd))
+    app.add_handler(CommandHandler("disconnectphantom", disconnectphantom_cmd))
+
 
     # Existing commands
     app.add_handler(CommandHandler("bonded", bonded_cmd))
