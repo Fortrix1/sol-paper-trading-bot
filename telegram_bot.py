@@ -1535,23 +1535,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"New paper balance: {balance:.3f} SOL",
             parse_mode="Markdown",
         )
-
-    elif data.startswith("realbuy:"):
+    elif data.startswith("realbuy_pct:"):
         _, mint, symbol = data.split(":", 2)
         if not phantom.is_ready():
             await query.message.reply_text(
-                "❌ *Real wallet not funded*\n"
+                "❌ *Real wallet not funded*
+"
                 f"Send SOL to: `{phantom.public_key}`",
                 parse_mode="Markdown",
             )
             return
-        result = await asyncio.to_thread(real_trader.buy, mint, symbol, config.DEFAULT_BUY_SIZE_SOL)
+        keyboard = InlineKeyboardMarkup([make_pct_buttons(mint, symbol)])
+        await query.message.reply_text(
+            f"🔴 *REAL BUY — {symbol}*
+"
+            f"Select what % of your available SOL to spend:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    elif data.startswith("realbuy_exec:"):
+        _, mint, symbol, pct_str = data.split(":", 3)
+        pct = float(pct_str)
+        balance = phantom.get_balance_sol()
+        available = max(0, balance - config.MIN_SOL_RESERVE)
+        sol_amount = available * pct
+
+        if sol_amount <= 0:
+            await query.message.reply_text("❌ Not enough SOL available.")
+            return
+
+        result = await asyncio.to_thread(real_trader.buy, mint, symbol, sol_amount)
         if not result["ok"]:
             await query.message.reply_text(f"❌ Real buy failed: {result['error']}")
             return
+
         await query.message.reply_text(
-            f"🔴 *REAL BUY EXECUTED*\n"
-            f"{symbol} -- `{result['sol_spent']:.4f} SOL` → `{result['tokens_received']:,.0f}` tokens",
+            f"🔴 *REAL BUY EXECUTED*
+"
+            f"
+"
+            f"Token: *{symbol}*
+"
+            f"Spent: `{result['sol_spent']:.4f} SOL`
+"
+            f"Received: `{result['tokens_received']:,.2f}` tokens
+"
+            f"Entry: `${result['price_usd']:.8f}`
+"
+            f"Tx: `{result['tx_signature'][:20]}...`",
             parse_mode="Markdown",
         )
 
