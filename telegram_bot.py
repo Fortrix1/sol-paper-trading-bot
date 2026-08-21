@@ -207,16 +207,16 @@ def make_trade_buttons(mint: str, symbol: str) -> list:
     """Returns a row with both Paper and Real buy buttons."""
     return [
         InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{mint}:{symbol}"),
-        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy_pct:{mint}:{symbol}"),
+        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"rbp:{mint}:{symbol}"),
     ]
 
 def make_pct_buttons(mint: str, symbol: str) -> list:
     """Returns percentage selection buttons for real buy."""
     return [
-        InlineKeyboardButton("25%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.25"),
-        InlineKeyboardButton("50%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.50"),
-        InlineKeyboardButton("75%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.75"),
-        InlineKeyboardButton("100%", callback_data=f"realbuy_exec:{mint}:{symbol}:1.00"),
+        InlineKeyboardButton("25%", callback_data=f"rbe:{mint}:{symbol}:0.25"),
+        InlineKeyboardButton("50%", callback_data=f"rbe:{mint}:{symbol}:0.50"),
+        InlineKeyboardButton("75%", callback_data=f"rbe:{mint}:{symbol}:0.75"),
+        InlineKeyboardButton("100%", callback_data=f"rbe:{mint}:{symbol}:1.00"),
     ]
 
 
@@ -1539,7 +1539,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    elif data.startswith("realbuy_pct:"):
+    elif data.startswith("rbp:"):
         _, mint, symbol = data.split(":", 2)
         if not phantom.is_ready():
             await query.message.reply_text(
@@ -1556,7 +1556,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
 
-    elif data.startswith("realbuy_exec:"):
+    elif data.startswith("rbe:"):
         _, mint, symbol, pct_str = data.split(":", 3)
         pct = float(pct_str)
         balance = phantom.get_balance_sol()
