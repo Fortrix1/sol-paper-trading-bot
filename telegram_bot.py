@@ -805,6 +805,42 @@ async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def realsell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: `/realsell <token_address>`", parse_mode="Markdown")
+        return
+
+    mint = context.args[0]
+    if not MINT_PATTERN.match(mint):
+        await update.message.reply_text("Invalid Solana address.")
+        return
+
+    if mint not in real_trader.positions:
+        await update.message.reply_text("❌ No open real position in this token.")
+        return
+
+    await update.message.reply_text("🔴 Executing REAL sell...")
+
+    result = await asyncio.to_thread(real_trader.sell, mint)
+    if not result["ok"]:
+        await update.message.reply_text(f"❌ Sell failed: {result['error']}")
+        return
+
+    emoji = "🟢" if result["pnl_sol"] >= 0 else "🔴"
+    await update.message.reply_text(
+        f"{emoji} *REAL SELL EXECUTED*\n"
+        f"\n"
+        f"Token: *{result['symbol']}*\n"
+        f"Entry: `${result['entry_price_usd']:.8f}`\n"
+        f"Received: `{result['sol_received']:.4f} SOL`\n"
+        f"P&L: `{result['pnl_sol']:+.4f} SOL` (`{result['pnl_percent']:+.2f}%`)\n"
+        f"Tx: `{result['tx_signature'][:20]}...`",
+        parse_mode="Markdown",
+    )
+
+
+
+
 async def realpositions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not real_trader.positions:
         await update.message.reply_text("🔴 No real positions open.")
