@@ -204,8 +204,18 @@ def make_trade_buttons(mint: str, symbol: str) -> list:
     """Returns a row with both Paper and Real buy buttons."""
     return [
         InlineKeyboardButton("🚀 APE IN (Paper)", callback_data=f"buy:{mint}:{symbol}"),
-        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy:{mint}:{symbol}"),
+        InlineKeyboardButton("🔴 REAL BUY", callback_data=f"realbuy_pct:{mint}:{symbol}"),
     ]
+
+def make_pct_buttons(mint: str, symbol: str) -> list:
+    """Returns percentage selection buttons for real buy."""
+    return [
+        InlineKeyboardButton("25%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.25"),
+        InlineKeyboardButton("50%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.50"),
+        InlineKeyboardButton("75%", callback_data=f"realbuy_exec:{mint}:{symbol}:0.75"),
+        InlineKeyboardButton("100%", callback_data=f"realbuy_exec:{mint}:{symbol}:1.00"),
+    ]
+
 
 
 def format_token_card(mint: str, info: dict, safety: dict, dev_rep: dict = None,
@@ -679,8 +689,15 @@ async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/realbuy <token_address> [sol_amount]`\n"
-            f"Example: `/realbuy ABC123... 0.05` (default: {config.DEFAULT_BUY_SIZE_SOL} SOL)",
+            "Usage: `/realbuy <token_address> [amount]`
+"
+            f"Amount can be:
+"
+            f"  • A SOL value: `0.05`
+"
+            f"  • A percentage: `25%`, `50%`, `75%`, `100%`
+"
+            f"Example: `/realbuy ABC123... 50%`",
             parse_mode="Markdown",
         )
         return
@@ -690,19 +707,56 @@ async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid Solana address.")
         return
 
-    sol_amount = float(context.args[1]) if len(context.args) > 1 else config.DEFAULT_BUY_SIZE_SOL
-
     if not phantom.is_ready():
         await update.message.reply_text(
-            "❌ *Real wallet not ready*\n"
-            f"Send at least `{config.MIN_SOL_RESERVE + 0.05:.3f} SOL` to:\n"
-            f"`{phantom.public_key}`\n\n"
+            "❌ *Real wallet not ready*
+"
+            f"Send at least `{config.MIN_SOL_RESERVE + 0.05:.3f} SOL` to:
+"
+            f"`{phantom.public_key}`
+
+"
             "_Copy the address and send from Phantom._",
             parse_mode="Markdown",
         )
         return
 
-    await update.message.reply_text(f"🔴 Executing REAL buy of `{sol_amount} SOL`...", parse_mode="Markdown")
+    balance = phantom.get_balance_sol()
+    available = max(0, balance - config.MIN_SOL_RESERVE)
+
+    # Parse amount
+    amount_arg = context.args[1] if len(context.args) > 1 else str(config.DEFAULT_BUY_SIZE_SOL)
+    amount_arg = amount_arg.strip()
+
+    if amount_arg.endswith("%"):
+        try:
+            pct = float(amount_arg[:-1]) / 100.0
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage. Use: `25%`, `50%`, `75%`, or `100%`")
+            return
+        sol_amount = available * pct
+        pct_display = int(pct * 100)
+    else:
+        try:
+            sol_amount = float(amount_arg)
+            pct_display = None
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount. Use a number like `0.05` or a percentage like `50%`")
+            return
+
+    if sol_amount > available:
+        await update.message.reply_text(
+            f"❌ Not enough SOL. You asked for `{sol_amount:.4f}` but only `{available:.4f}` is available (reserve: {config.MIN_SOL_RESERVE}).",
+            parse_mode="Markdown",
+        )
+        return
+
+    if sol_amount <= 0:
+        await update.message.reply_text("❌ Amount must be greater than 0.")
+        return
+
+    pct_text = f" ({pct_display}% of available)" if pct_display else ""
+    await update.message.reply_text(f"🔴 Executing REAL buy of `{sol_amount:.4f} SOL`{pct_text}...", parse_mode="Markdown")
 
     info = await _get_token_info_sync(mint)
     symbol = info.get("symbol", "?") if info.get("ok") else "?"
@@ -713,19 +767,27 @@ async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"🟢 *REAL BUY EXECUTED*\n"
-        f"\n"
-        f"Token: *{symbol}*\n"
-        f"Mint: `{mint}`\n"
-        f"Spent: `{result['sol_spent']:.4f} SOL`\n"
-        f"Received: `{result['tokens_received']:,.2f}` tokens\n"
-        f"Entry: `${result['price_usd']:.8f}`\n"
-        f"Tx: `{result['tx_signature'][:20]}...`\n"
-        f"\n"
+        f"🟢 *REAL BUY EXECUTED*
+"
+        f"
+"
+        f"Token: *{symbol}*
+"
+        f"Mint: `{mint}`
+"
+        f"Spent: `{result['sol_spent']:.4f} SOL`{pct_text}
+"
+        f"Received: `{result['tokens_received']:,.2f}` tokens
+"
+        f"Entry: `${result['price_usd']:.8f}`
+"
+        f"Tx: `{result['tx_signature'][:20]}...`
+"
+        f"
+"
         f"_Auto TP: +{config.TAKE_PROFIT_PERCENT:.0f}% | Auto SL: {config.STOP_LOSS_PERCENT:.0f}%_",
         parse_mode="Markdown",
     )
-
 
 async def realsell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
