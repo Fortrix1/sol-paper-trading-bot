@@ -1539,16 +1539,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, mint, symbol = data.split(":", 2)
         if not phantom.is_ready():
             await query.message.reply_text(
-                "❌ *Real wallet not funded*
-"
+                "❌ *Real wallet not funded*\n"
                 f"Send SOL to: `{phantom.public_key}`",
                 parse_mode="Markdown",
             )
             return
         keyboard = InlineKeyboardMarkup([make_pct_buttons(mint, symbol)])
         await query.message.reply_text(
-            f"🔴 *REAL BUY — {symbol}*
-"
+            f"🔴 *REAL BUY — {symbol}*\n"
             f"Select what % of your available SOL to spend:",
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -1571,18 +1569,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.message.reply_text(
-            f"🔴 *REAL BUY EXECUTED*
-"
-            f"
-"
-            f"Token: *{symbol}*
-"
-            f"Spent: `{result['sol_spent']:.4f} SOL`
-"
-            f"Received: `{result['tokens_received']:,.2f}` tokens
-"
-            f"Entry: `${result['price_usd']:.8f}`
-"
+            f"🔴 *REAL BUY EXECUTED*\n"
+            f"\n"
+            f"Token: *{symbol}*\n"
+            f"Spent: `{result['sol_spent']:.4f} SOL`\n"
+            f"Received: `{result['tokens_received']:,.2f}` tokens\n"
+            f"Entry: `${result['price_usd']:.8f}`\n"
             f"Tx: `{result['tx_signature'][:20]}...`",
             parse_mode="Markdown",
         )
