@@ -110,13 +110,16 @@ def _read_live_discoveries_sync(event_type: str, max_age_seconds: int = 3600) ->
             for line in f:
                 if not line.strip():
                     continue
-                rec = json.loads(line)
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 if rec.get("type") != event_type:
                     continue
                 if now - rec.get("discovered_at", 0) > max_age_seconds:
                     continue
                 results.append(rec)
-    except (IOError, json.JSONDecodeError):
+    except IOError:
         return []
     results.sort(key=lambda r: r.get("discovered_at", 0), reverse=True)
     return results
@@ -1535,6 +1538,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"New paper balance: {balance:.3f} SOL",
             parse_mode="Markdown",
         )
+
     elif data.startswith("realbuy_pct:"):
         _, mint, symbol = data.split(":", 2)
         if not phantom.is_ready():
