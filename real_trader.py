@@ -51,8 +51,8 @@ class RealTrader:
         with open("real_tx_history.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
 
-    def get_jupiter_quote(self, input_mint: str, output_mint: str, amount_lamports: int, slippage_bps: int = None) -> Optional[Dict]:
-        """Get Jupiter quote for a swap."""
+    def get_jupiter_quote(self, input_mint: str, output_mint: str, amount_lamports: int, slippage_bps: int = None) -> Dict:
+        """Get Jupiter quote for a swap. Returns {ok, data} or {ok, error, status}."""
         try:
             params = {
                 "inputMint": input_mint,
@@ -61,11 +61,18 @@ class RealTrader:
                 "slippageBps": slippage_bps or config.MAX_SLIPPAGE_BPS,
             }
             resp = requests.get(config.JUPITER_QUOTE_URL, params=params, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
+            if resp.status_code != 200:
+                try:
+                    err_body = resp.json()
+                    err_msg = err_body.get("error") or err_body.get("message") or resp.text[:200]
+                except Exception:
+                    err_msg = resp.text[:200] or f"HTTP {resp.status_code}"
+                return {"ok": False, "error": err_msg, "status": resp.status_code}
+            return {"ok": True, "data": resp.json()}
+        except requests.exceptions.RequestException as e:
+            return {"ok": False, "error": f"Network error: {e}", "status": 0}
         except Exception as e:
-            print(f"Jupiter quote failed: {e}")
-            return None
+            return {"ok": False, "error": f"Unexpected error: {e}", "status": 0}
 
     def execute_swap(self, quote_response: Dict) -> Dict:
         """
@@ -143,17 +150,25 @@ class RealTrader:
         if balance < sol_amount + config.MIN_SOL_RESERVE:
             return {"ok": False, "error": f"Insufficient SOL. Have: {balance:.4f}, Need: {sol_amount + config.MIN_SOL_RESERVE:.4f}"}
 
+        MIN_TRADE_SOL = 0.005
+        if sol_amount < MIN_TRADE_SOL:
+            return {"ok": False, "error": f"Trade size too small. Minimum: {MIN_TRADE_SOL} SOL. You tried: {sol_amount:.4f} SOL"}
+
         lamports = int(sol_amount * 1_000_000_000)
-        quote = self.get_jupiter_quote(
+        quote_result = self.get_jupiter_quote(
             input_mint="So11111111111111111111111111111111111111112",  # SOL
             output_mint=mint,
             amount_lamports=lamports,
         )
 
-        if not quote:
-            return {"ok": False, "error": "Jupiter quote failed - token may not have liquidity"}
+        if not quote_result.get("ok"):
+            err = quote_result.get("error", "Unknown error")
+            status = quote_result.get("status", 0)
+            if status == 400 and "route" in err.lower():
+                return {"ok": False, "error": f"Jupiter: no trade route found for this token yet. It may be too new or have too little liquidity. ({err})"}
+            return {"ok": False, "error": f"Jupiter quote failed: {err}"}
 
-        result = self.execute_swap(quote)
+        result = self.execute_swap(quote_result["data"])
         if not result["ok"]:
             return result
 
@@ -216,16 +231,17 @@ class RealTrader:
 
         raw_amount = int(pos["tokens_held"] * (10 ** decimals))
 
-        quote = self.get_jupiter_quote(
+        quote_result = self.get_jupiter_quote(
             input_mint=mint,
             output_mint="So11111111111111111111111111111111111111112",  # SOL
             amount_lamports=raw_amount,
         )
 
-        if not quote:
-            return {"ok": False, "error": "Jupiter quote failed - may be illiquid"}
+        if not quote_result.get("ok"):
+            err = quote_result.get("error", "Unknown error")
+            return {"ok": False, "error": f"Jupiter quote failed: {err}"}
 
-        result = self.execute_swap(quote)
+        result = self.execute_swap(quote_result["data"])
         if not result["ok"]:
             return result
 
