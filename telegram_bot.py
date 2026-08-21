@@ -689,15 +689,11 @@ async def holdings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/realbuy <token_address> [amount]`
-"
-            f"Amount can be:
-"
-            f"  • A SOL value: `0.05`
-"
-            f"  • A percentage: `25%`, `50%`, `75%`, `100%`
-"
-            f"Example: `/realbuy ABC123... 50%`",
+            "Usage: `/realbuy <token_address> [amount]`\n"
+            "Amount can be:\n"
+            "  • A SOL value: `0.05`\n"
+            "  • A percentage: `25%`, `50%`, `75%`, `100%`\n"
+            "Example: `/realbuy ABC123... 50%`",
             parse_mode="Markdown",
         )
         return
@@ -709,13 +705,9 @@ async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not phantom.is_ready():
         await update.message.reply_text(
-            "❌ *Real wallet not ready*
-"
-            f"Send at least `{config.MIN_SOL_RESERVE + 0.05:.3f} SOL` to:
-"
-            f"`{phantom.public_key}`
-
-"
+            "❌ *Real wallet not ready*\n"
+            f"Send at least `{config.MIN_SOL_RESERVE + 0.05:.3f} SOL` to:\n"
+            f"`{phantom.public_key}`\n\n"
             "_Copy the address and send from Phantom._",
             parse_mode="Markdown",
         )
@@ -767,29 +759,19 @@ async def realbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"🟢 *REAL BUY EXECUTED*
-"
-        f"
-"
-        f"Token: *{symbol}*
-"
-        f"Mint: `{mint}`
-"
-        f"Spent: `{result['sol_spent']:.4f} SOL`{pct_text}
-"
-        f"Received: `{result['tokens_received']:,.2f}` tokens
-"
-        f"Entry: `${result['price_usd']:.8f}`
-"
-        f"Tx: `{result['tx_signature'][:20]}...`
-"
-        f"
-"
+        f"🟢 *REAL BUY EXECUTED*\n"
+        f"\n"
+        f"Token: *{symbol}*\n"
+        f"Mint: `{mint}`\n"
+        f"Spent: `{result['sol_spent']:.4f} SOL`{pct_text}\n"
+        f"Received: `{result['tokens_received']:,.2f}` tokens\n"
+        f"Entry: `${result['price_usd']:.8f}`\n"
+        f"Tx: `{result['tx_signature'][:20]}...`\n"
+        f"\n"
         f"_Auto TP: +{config.TAKE_PROFIT_PERCENT:.0f}% | Auto SL: {config.STOP_LOSS_PERCENT:.0f}%_",
         parse_mode="Markdown",
     )
 
-async def realsell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/realsell <token_address>`", parse_mode="Markdown")
         return
